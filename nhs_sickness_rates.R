@@ -1,492 +1,584 @@
 # ============================================================================
-# NHS Sickness Rate Analysis - Improved Visualization & Trend Detection
+# NHS Sickness Rate Analysis — FIXED & FUNCTIONAL (v2)
+# Breakpoints vs “observable norm” (2010–2018), seasonality-adjusted
+# ============================================================================
+# The script implements a retrospective time-series analysis of monthly NHS sickness absence rates in England,
+# designed to identify departures from an “observable norm” defined by the pre-event period 2010–2018.
+# Monthly percentages are converted to a rate per 100,000 staff and a 6-month rolling mean is computed using a symmetric window
+# (3 months prior through 2 months after the index month) to provide a smoothed descriptive series.
+
+# To operationalize the “norm,” the script fits an ordinary least squares baseline model on 2010–2018 raw monthly rates
+# with a deterministic linear time component and explicit seasonality via month-of-year fixed effects.
+# This model is then projected over the full series, producing fitted baseline expectations and both confidence and prediction intervals;
+# the baseline expectation is additionally “rolled” to align directly with the 6-month rolling observed series for visual and interpretive comparability.
+# Deviations from the norm are computed as both absolute differences (per-100k) and percentage differences (rolling series relative to the rolled baseline expectation),
+# which are later used for annotation of salient local highs/lows.
+
+# Structural change is assessed using the Bai–Perron multiple breakpoint framework applied not to the raw sickness rates,
+# but to the baseline-adjusted deviation series (raw deviation-from-norm).
+# This explicitly targets breakpoints in abnormality relative to the 2010–2018 regime rather than breaks driven by long-run
+# secular trend or seasonal structure.
+
+# The script supports two breakpoint specifications: an intercept-only model to detect step changes in deviation (“level”)
+# and a time-augmented model to detect changes in deviation slope (“trend”), with the number of breaks selected by BIC under minimum segment-size constraints.
+
+# For each detected breakpoint, approximate 95% confidence intervals for breakpoint timing are computed, and break direction is summarized via local mean deviations
+# in windows around the break. Finally, the script estimates simple within-segment linear trends on the smoothed (rolling) series between
+# break-defined boundaries for descriptive comparison and produces a publication-style plot combining raw data,
+# rolling series, baseline expectation, prediction band, break markers, and deviation labels at local extrema.
 # ============================================================================
 
 # ---- Packages ----
-# install.packages(c("tidyverse", "lubridate", "slider", "scales", "ggrepel"))
+# install.packages(c("tidyverse", "lubridate", "slider", "scales", "ggrepel", "strucchange"))
 library(tidyverse)
 library(lubridate)
 library(slider)
 library(scales)
-library(ggrepel)  # For non-overlapping labels
+library(ggrepel)
+library(strucchange)
 
-# ---- Read data ----
-df <- read.csv("data/overall_sickness_rates.csv", stringsAsFactors = FALSE) |>
-  as_tibble() |>
+# ---- User-tunable parameters ----
+DATA_PATH <- "data/overall_sickness_rates.csv"
+
+BASELINE_START <- 2010
+BASELINE_END   <- 2018
+PROJ_START     <- 2019
+PROJ_END       <- 2025
+
+# Rolling window: (t-3, t-2, t-1, t, t+1, t+2)  => 6 points
+ROLL_BEFORE <- 3
+ROLL_AFTER  <- 2
+ROLL_COMPLETE <- TRUE
+
+# Breakpoints configuration
+MAX_BREAKS <- 10
+H_FRACTION <- 0.10    # minimum 10% of data per segment
+
+# Breakpoint model choice:
+# - "level": step changes in deviation (dev_100k_raw ~ 1)
+# - "trend": changes in deviation trend (dev_100k_raw ~ month_num)
+# (You set this to "level" in your edit; keep it if you prefer level shifts)
+BP_MODEL_TYPE <- "level"
+
+# ---- Helpers ----
+
+safe_month <- function(x) {
+  # Tries multiple month formats robustly; returns Date (first of month) or NA
+  x <- as.character(x)
+  
+  d <- suppressWarnings(my(x))  # good for "Jan 2010", "Jan-2010", etc
+  
+  if (anyNA(d)) {
+    d2 <- suppressWarnings(parse_date_time(
+      x,
+      orders = c(
+        "my", "Ym", "Y-m", "Y/m",
+        "bY", "Yb", "mY", "m/Y",
+        "b-Y", "Y-b", "Ymd", "Y-m-d", "Y/m/d"
+      ),
+      tz = "UTC"
+    ))
+    d[is.na(d)] <- d2[is.na(d)]
+  }
+  
+  # normalize to first day of month
+  d <- floor_date(as.Date(d), unit = "month")
+  as.Date(d)
+}
+
+get_optimal_breaks_bic <- function(bp_full_obj) {
+  s <- summary(bp_full_obj)
+  
+  # BIC is typically provided as s$BIC
+  if (!is.null(s$BIC)) {
+    bic <- s$BIC
+  } else if (!is.null(s$RSS) && is.matrix(s$RSS) && "BIC" %in% rownames(s$RSS)) {
+    bic <- s$RSS["BIC", ]
+  } else {
+    stop("Could not extract BIC from breakpoint summary. Check strucchange version/output.")
+  }
+  
+  idx <- which.min(bic)
+  
+  # Prefer named break counts if present
+  if (!is.null(names(bic)) && nzchar(names(bic)[idx])) {
+    return(as.integer(names(bic)[idx]))
+  }
+  
+  # Fallback: assume entries correspond to 0,1,2,... breaks
+  as.integer(idx - 1)
+}
+
+cap_max_breaks <- function(n, h, requested) {
+  # maximum feasible breaks given minimum segment fraction h:
+  # each segment must have at least floor(h*n) points; so max segments ≈ floor(1/h)
+  # => max breaks ≈ floor(1/h) - 1
+  max_by_h <- max(0, floor(1 / h) - 1)
+  max_by_n <- max(0, n - 2)  # need at least 2 points to define any segmentation sensibly
+  min(requested, max_by_h, max_by_n)
+}
+
+# ============================================================================
+# Read data
+# ============================================================================
+raw <- read.csv(DATA_PATH, stringsAsFactors = FALSE) |>
+  as_tibble()
+
+df <- raw |>
   rename(rate_pct = England) |>
   mutate(
-    month     = my(Month),
-    rate_pct  = as.numeric(rate_pct)
+    month    = safe_month(Month),
+    rate_pct = as.numeric(rate_pct)
   ) |>
   arrange(month) |>
   mutate(
-    # Convert percent -> per 100,000 (multiply by 1000)
-    rate_100k = rate_pct * 1000
+    rate_100k = rate_pct * 1000,                 # 1% = 1000 per 100k
+    month_num = as.numeric(month),
+    month_of_year = factor(month(month), levels = 1:12, labels = month.abb)
   )
 
-# ---- 6-month rolling average: (t-3, t-2, t-1, t, t+1, t+2) ----
+# Report failed month parses (your warning said 2)
+bad_month_rows <- df |> filter(is.na(month))
+if (nrow(bad_month_rows) > 0) {
+  warning(sprintf("Month parsing failed for %d rows. Showing the Month values:", nrow(bad_month_rows)))
+  print(bad_month_rows |> select(Month) |> distinct())
+}
+
+# ---- 6-month rolling average ----
 df <- df |>
   mutate(
-    roll6_100k = slide_dbl(rate_100k, mean, .before = 3, .after = 2, .complete = TRUE),
-    month_num  = as.numeric(month)
+    roll6_100k = slide_dbl(
+      rate_100k,
+      ~ mean(.x, na.rm = TRUE),
+      .before = ROLL_BEFORE,
+      .after  = ROLL_AFTER,
+      .complete = ROLL_COMPLETE
+    )
   )
 
-# ---- Linear trend fit on rolling average for 2010-2018 (unbiased baseline) ----
+# ============================================================================
+# Baseline model ("observable norm") 2010–2018: seasonality + time
+# ============================================================================
 df_fit <- df |>
-  filter(year(month) >= 2010, year(month) <= 2018, !is.na(roll6_100k))
+  filter(year(month) >= BASELINE_START, year(month) <= BASELINE_END) |>
+  filter(!is.na(rate_100k), !is.na(month_num), !is.na(month_of_year))
 
-fit_2010_2018 <- lm(roll6_100k ~ month_num, data = df_fit)
+fit_2010_2018 <- lm(rate_100k ~ month_num + month_of_year, data = df_fit)
 
-# ---- Predictions + confidence intervals (2010-2018 trend) ----
-pred_all <- as_tibble(predict(fit_2010_2018, newdata = df, interval = "confidence", level = 0.95)) |>
-  rename(trend_100k = fit, ci_low_100k = lwr, ci_high_100k = upr)
+slope_2010_2018 <- unname(coef(fit_2010_2018)["month_num"]) * 365.25
 
-df <- bind_cols(df, pred_all) |>
+# Predictions: mean + CI + prediction interval
+pred_ci <- as_tibble(predict(fit_2010_2018, newdata = df, interval = "confidence", level = 0.95)) |>
+  rename(norm_fit_100k = fit, norm_ci_low_100k = lwr, norm_ci_high_100k = upr)
+
+pred_pi <- as_tibble(predict(fit_2010_2018, newdata = df, interval = "prediction", level = 0.95)) |>
+  rename(norm_pi_low_100k = lwr, norm_pi_high_100k = upr) |>
+  select(norm_pi_low_100k, norm_pi_high_100k)
+
+df <- bind_cols(df, pred_ci, pred_pi) |>
   mutate(
     period = case_when(
-      year(month) >= 2010 & year(month) <= 2018 ~ "fit_2010_2018",
-      year(month) >= 2019 & year(month) <= 2025 ~ "proj_2019_2025",
+      year(month) >= BASELINE_START & year(month) <= BASELINE_END ~ "fit_2010_2018",
+      year(month) >= PROJ_START     & year(month) <= PROJ_END     ~ "proj_2019_2025",
       TRUE ~ "other"
-    ),
-    dev_pct = if_else(
-      year(month) >= 2019 & year(month) <= 2025 & !is.na(roll6_100k) & !is.na(trend_100k),
-      100 * (roll6_100k - trend_100k) / trend_100k,
-      NA_real_
-    ),
-    dev_label = if_else(!is.na(dev_pct), sprintf("%+.1f%%", dev_pct), NA_character_)
+    )
   )
 
+# Roll the baseline expectation and bands to match rolling plotted series
+df <- df |>
+  mutate(
+    norm_fit_roll6     = slide_dbl(norm_fit_100k, mean, .before = ROLL_BEFORE, .after = ROLL_AFTER, .complete = ROLL_COMPLETE),
+    norm_pi_low_roll6  = slide_dbl(norm_pi_low_100k, mean, .before = ROLL_BEFORE, .after = ROLL_AFTER, .complete = ROLL_COMPLETE),
+    norm_pi_high_roll6 = slide_dbl(norm_pi_high_100k, mean, .before = ROLL_BEFORE, .after = ROLL_AFTER, .complete = ROLL_COMPLETE)
+  )
+
+# Deviations vs baseline
+df <- df |>
+  mutate(
+    dev_100k_raw  = if_else(!is.na(rate_100k)  & !is.na(norm_fit_100k),  rate_100k  - norm_fit_100k,  NA_real_),
+    dev_100k_roll = if_else(!is.na(roll6_100k) & !is.na(norm_fit_roll6), roll6_100k - norm_fit_roll6, NA_real_),
+    dev_pct_roll  = if_else(!is.na(roll6_100k) & !is.na(norm_fit_roll6) & norm_fit_roll6 != 0,
+                            100 * (roll6_100k - norm_fit_roll6) / norm_fit_roll6,
+                            NA_real_),
+    dev_label_roll = if_else(!is.na(dev_pct_roll), sprintf("%+.1f%%", dev_pct_roll), NA_character_)
+  )
 
 # ============================================================================
-# REQUIREMENT 2: Detect ALL Structural Breaks (Bai-Perron)
+# STRUCTURAL BREAKS (Bai–Perron) ON DEVIATION-FROM-NORM (RAW)
+#   IMPORTANT FIX: refit a FULL breakpoints model with breaks=optimal_n
+#   so confint() works (no vcov error).
 # ============================================================================
-# 
-# Using the Bai-Perron (1998, 2003) structural break test via strucchange.
-# We detect ALL breaks that the algorithm finds optimal.
-#
-# Configuration:
-# - Baseline: 2010-2018 (excludes any potential late-2019 contamination)
-# - Data: RAW monthly data (rate_100k) - not smoothed
-# - Model: Testing for level shifts (intercept-only model)
-# - No limit on number of breaks - let BIC decide
-#
-# ============================================================================
-
-library(strucchange)
-
 cat("\n========================================\n")
 cat("BAI-PERRON STRUCTURAL BREAK ANALYSIS\n")
 cat("========================================\n")
-cat("Baseline: 2010-2018 trend projection\n")
-cat("Data: RAW monthly data (not smoothed)\n")
-cat("Model: Level shifts (intercept-only)\n\n")
+cat(sprintf("Baseline norm: %d-%d (seasonality + time)\n", BASELINE_START, BASELINE_END))
+cat("Breakpoints run on deviation-from-norm (RAW): dev_100k_raw\n")
+cat(sprintf("Model type: %s\n\n", BP_MODEL_TYPE))
 
-# ---- Prepare data for Bai-Perron ----
 df_for_bp <- df |>
-  filter(!is.na(rate_100k)) |>
+  filter(!is.na(dev_100k_raw), !is.na(month), !is.na(month_num)) |>
   arrange(month) |>
   mutate(row_idx = row_number())
 
-# ---- Fit Bai-Perron model ----
-# Using intercept-only model to detect level shifts on RAW data
-# h = 0.10 allows for more breaks (minimum 10% of data per segment)
-bp_model <- breakpoints(
-  rate_100k ~ 1,
-  data = df_for_bp,
-  h = 0.10,
-  breaks = 10  # Allow up to 10 breaks
-)
-
-# Summary
-cat("Breakpoint model summary:\n")
-print(summary(bp_model))
-
-# Get BIC-optimal number of breaks
-bp_summary <- summary(bp_model)
-cat("\nBIC by number of breaks:\n")
-print(bp_summary$RSS["BIC", , drop = FALSE])
-
-# Extract optimal breaks
-optimal_n <- which.min(bp_summary$RSS["BIC", ])
-if (names(optimal_n) == "0") {
-  optimal_n <- 0
+bp_formula <- if (BP_MODEL_TYPE == "level") {
+  dev_100k_raw ~ 1
 } else {
-  optimal_n <- as.numeric(names(optimal_n))
+  dev_100k_raw ~ month_num
 }
 
-cat(sprintf("\nBIC-optimal number of breaks: %d\n", optimal_n))
+# Cap max breaks to what is feasible (prevents "changed to 9" surprises)
+max_breaks_eff <- cap_max_breaks(n = nrow(df_for_bp), h = H_FRACTION, requested = MAX_BREAKS)
 
-# Get the breakpoints for optimal solution
+bp_full <- breakpoints(
+  bp_formula,
+  data   = df_for_bp,
+  h      = H_FRACTION,
+  breaks = max_breaks_eff
+)
+
+optimal_n <- get_optimal_breaks_bic(bp_full)
+cat(sprintf("BIC-optimal number of breaks: %d\n", optimal_n))
+
 if (optimal_n > 0) {
-  bp_optimal <- breakpoints(bp_model, breaks = optimal_n)
-  break_indices <- bp_optimal$breakpoints
   
-  # Convert to dates
-  all_breaks <- tibble(
-    break_num = 1:length(break_indices),
-    row_idx = break_indices,
-    month = df_for_bp$month[break_indices]
+  # REFIT as FULL model with breaks=optimal_n (this is the key fix)
+  bp_opt_full <- breakpoints(
+    bp_formula,
+    data   = df_for_bp,
+    h      = H_FRACTION,
+    breaks = optimal_n
   )
   
-  # Determine direction of each break (compare mean before vs after)
-  all_breaks <- all_breaks |>
+  break_indices <- bp_opt_full$breakpoints
+  
+  all_breaks <- tibble(
+    break_num = seq_along(break_indices),
+    row_idx   = break_indices,
+    month     = df_for_bp$month[break_indices]
+  ) |>
+    arrange(month) |>
     mutate(
-      mean_before = map_dbl(row_idx, ~ mean(df_for_bp$rate_100k[max(1, .x - 6):(.x - 1)], na.rm = TRUE)),
-      mean_after = map_dbl(row_idx, ~ mean(df_for_bp$rate_100k[(.x + 1):min(nrow(df_for_bp), .x + 6)], na.rm = TRUE)),
+      mean_before = map_dbl(row_idx, ~ mean(df_for_bp$dev_100k_raw[max(1, .x - 6):max(1, .x - 1)], na.rm = TRUE)),
+      mean_after  = map_dbl(row_idx, ~ mean(df_for_bp$dev_100k_raw[min(nrow(df_for_bp), .x + 1):min(nrow(df_for_bp), .x + 6)], na.rm = TRUE)),
       direction = if_else(mean_after > mean_before, "up", "down")
     )
   
-  # Get confidence intervals
-  bp_confint <- confint(bp_model, breaks = optimal_n, level = 0.95)
+  # CI now works (because bp_opt_full is "breakpointsfull")
+  bp_conf <- confint(bp_opt_full, level = 0.95)
+  
+  all_breaks <- all_breaks |>
+    mutate(
+      ci_lower_month = df_for_bp$month[pmax(1, bp_conf$confint[, 1])],
+      ci_upper_month = df_for_bp$month[pmin(nrow(df_for_bp), bp_conf$confint[, 3])]
+    )
   
   cat("\n----------------------------------------\n")
-  cat("DETECTED STRUCTURAL BREAKS:\n")
+  cat("DETECTED STRUCTURAL BREAKS (on dev_100k_raw):\n")
   cat("----------------------------------------\n")
-  
   for (i in 1:nrow(all_breaks)) {
     direction_symbol <- if_else(all_breaks$direction[i] == "up", "↑ UP", "↓ DOWN")
-    ci_lower <- df_for_bp$month[bp_confint$confint[i, 1]]
-    ci_upper <- df_for_bp$month[bp_confint$confint[i, 3]]
-    cat(sprintf("  Break %d: %s  %s\n", 
+    cat(sprintf("  Break %d: %s  %s\n",
                 i,
                 format(all_breaks$month[i], "%B %Y"),
                 direction_symbol))
     cat(sprintf("           95%% CI: [%s - %s]\n",
-                format(ci_lower, "%b %Y"),
-                format(ci_upper, "%b %Y")))
+                format(all_breaks$ci_lower_month[i], "%b %Y"),
+                format(all_breaks$ci_upper_month[i], "%b %Y")))
   }
+  
+  cat("\nSegment coefficients (optimal model):\n")
+  print(coef(bp_opt_full))
   
 } else {
   cat("\nNo structural breaks detected by BIC criterion.\n")
   all_breaks <- tibble(
     break_num = integer(),
-    row_idx = integer(),
-    month = as.Date(character()),
-    direction = character()
+    row_idx   = integer(),
+    month     = as.Date(character()),
+    direction = character(),
+    ci_lower_month = as.Date(character()),
+    ci_upper_month = as.Date(character())
   )
 }
 
 cat("========================================\n\n")
 
-# Also show segment means
-cat("Segment means (Bai-Perron):\n")
-segment_means <- coef(bp_model)
-print(segment_means)
-
-# For backward compatibility - use first two breaks if they exist
-inflection_month_1 <- if (nrow(all_breaks) >= 1) all_breaks$month[1] else NA
-inflection_month_2 <- if (nrow(all_breaks) >= 2) all_breaks$month[2] else NA
-inflection_ci_lower_1 <- NA
-inflection_ci_upper_1 <- NA
-inflection_ci_lower_2 <- NA
-inflection_ci_upper_2 <- NA
-inflection_month <- inflection_month_1
-inflection_ci_lower <- NA
-inflection_ci_upper <- NA
-
 # ============================================================================
-# FIND ALL LOCAL HIGHS AND LOWS (for deviation labels)
+# LOCAL EXTREMA (for deviation labels)
 # ============================================================================
-
 cat("Finding all local highs and lows...\n")
 
-# Find local extrema in the rolling average
 df <- df |>
   mutate(
-    # Local max: higher than both neighbors
     is_local_max = roll6_100k > lag(roll6_100k) & roll6_100k > lead(roll6_100k),
-    # Local min: lower than both neighbors
     is_local_min = roll6_100k < lag(roll6_100k) & roll6_100k < lead(roll6_100k)
   )
 
-# Get all local maxima and minima from 2010 onwards
 local_extrema <- df |>
-  filter(year(month) >= 2010, !is.na(roll6_100k)) |>
+  filter(year(month) >= BASELINE_START, !is.na(roll6_100k), !is.na(norm_fit_roll6)) |>
   filter(is_local_max | is_local_min) |>
   mutate(
     extrema_type = if_else(is_local_max, "high", "low"),
-    dev_pct_extrema = 100 * (roll6_100k - trend_100k) / trend_100k,
-    dev_label_extrema = sprintf("%+.1f%%", dev_pct_extrema)
+    dev_label_extrema = sprintf("%+.1f%%", dev_pct_roll)
   ) |>
-  select(month, roll6_100k, trend_100k, extrema_type, dev_pct_extrema, dev_label_extrema)
+  select(month, roll6_100k, norm_fit_roll6, extrema_type, dev_pct_roll, dev_label_extrema)
 
-cat(sprintf("Found %d local extrema (highs and lows) from 2010 onwards\n", nrow(local_extrema)))
-cat(sprintf("  - %d highs\n", sum(local_extrema$extrema_type == "high")))
-cat(sprintf("  - %d lows\n", sum(local_extrema$extrema_type == "low")))
+cat(sprintf("Found %d local extrema from %d onwards\n", nrow(local_extrema), BASELINE_START))
 
 # ============================================================================
-# CALCULATE ALL SEGMENT TRENDS
+# SEGMENT TRENDS (on roll6_100k) with correct boundaries
 # ============================================================================
-
 cat("\n========================================\n")
-cat("SEGMENT TREND ANALYSIS\n")
+cat("SEGMENT TREND ANALYSIS (on roll6_100k)\n")
 cat("========================================\n")
 
-# Store all segment trends
 segment_trends <- list()
 
-if (nrow(all_breaks) >= 1) {
-  # Calculate trend for each segment between consecutive breaks
-  for (i in 1:(nrow(all_breaks))) {
-    start_date <- if (i == 1) min(df$month, na.rm = TRUE) else all_breaks$month[i]
-    end_date <- if (i == nrow(all_breaks)) max(df$month, na.rm = TRUE) else all_breaks$month[i + 1]
+if (nrow(all_breaks) > 0) {
+  break_dates <- sort(all_breaks$month)
+  boundaries <- c(min(df$month, na.rm = TRUE), break_dates, max(df$month, na.rm = TRUE))
+  
+  for (i in seq_len(length(boundaries) - 1)) {
+    start_date <- boundaries[i]
+    end_date   <- boundaries[i + 1]
     
-    segment_name <- sprintf("B%d_to_%s", i, if (i == nrow(all_breaks)) "end" else sprintf("B%d", i + 1))
+    seg_name <- if (i == 1) "pre_B1" else sprintf("B%d_to_B%d", i - 1, i)
     
     df_segment <- df |>
-      filter(month >= start_date, month < end_date, !is.na(roll6_100k))
+      filter(month >= start_date, month < end_date, !is.na(roll6_100k), !is.na(month_num))
     
     if (nrow(df_segment) >= 3) {
       fit_segment <- lm(roll6_100k ~ month_num, data = df_segment)
-      slope <- coef(fit_segment)[2] * 365.25
-      segment_trends[[segment_name]] <- list(
-        start = start_date,
-        end = end_date,
-        slope = slope,
-        fit = fit_segment
-      )
-      cat(sprintf("  %s (%s to %s): %+.1f per 100k/year\n",
-                  segment_name,
-                  format(start_date, "%b %Y"),
-                  format(end_date, "%b %Y"),
-                  slope))
+      slope <- unname(coef(fit_segment)[2]) * 365.25
+      segment_trends[[seg_name]] <- list(start = start_date, end = end_date, slope = slope, fit = fit_segment)
+      
+      cat(sprintf("  %-10s (%s to %s): %+.1f per 100k/year\n",
+                  seg_name, format(start_date, "%b %Y"), format(end_date, "%b %Y"), slope))
     }
   }
   
-  # Also calculate cumulative trends from each break to end
-  cat("\nCumulative trends (break to end):\n")
-  for (i in 1:nrow(all_breaks)) {
-    start_date <- all_breaks$month[i]
-    end_date <- max(df$month, na.rm = TRUE)
-    
-    segment_name <- sprintf("B%d_to_end", i)
-    
-    df_segment <- df |>
-      filter(month >= start_date, !is.na(roll6_100k))
-    
-    if (nrow(df_segment) >= 3) {
-      fit_segment <- lm(roll6_100k ~ month_num, data = df_segment)
-      slope <- coef(fit_segment)[2] * 365.25
-      segment_trends[[segment_name]] <- list(
-        start = start_date,
-        end = end_date,
-        slope = slope,
-        fit = fit_segment
-      )
-      cat(sprintf("  %s (%s to %s): %+.1f per 100k/year\n",
-                  segment_name,
-                  format(start_date, "%b %Y"),
-                  format(end_date, "%b %Y"),
-                  slope))
-    }
+  # Add "Bk_to_end"
+  k <- length(break_dates)
+  df_k_end <- df |> filter(month >= break_dates[k], !is.na(roll6_100k), !is.na(month_num))
+  if (nrow(df_k_end) >= 3) {
+    fit_k_end <- lm(roll6_100k ~ month_num, data = df_k_end)
+    slope_k_end <- unname(coef(fit_k_end)[2]) * 365.25
+    segment_trends[[sprintf("B%d_to_end", k)]] <- list(
+      start = break_dates[k],
+      end   = max(df$month, na.rm = TRUE),
+      slope = slope_k_end,
+      fit   = fit_k_end
+    )
+    cat(sprintf("  %-10s (%s to %s): %+.1f per 100k/year\n",
+                sprintf("B%d_to_end", k), format(break_dates[k], "%b %Y"),
+                format(max(df$month, na.rm = TRUE), "%b %Y"), slope_k_end))
   }
 }
 
-# Pre-break baseline trend
-cat("\nBaseline trend:\n")
-cat(sprintf("  2010-2018: %+.1f per 100k/year\n", slope_2010_2018))
-
+cat("\nBaseline slope (2010-2018):\n")
+cat(sprintf("  %+0.1f per 100k/year\n", slope_2010_2018))
 cat("========================================\n\n")
 
-# ---- Add trend lines to dataframe for plotting ----
-# Clear any existing trend columns
+# ============================================================================
+# MATERIALIZE SEGMENT TRENDS INTO df
+#   (creates trend_B1_B2, trend_B2_B3, trend_B3_end, trend_B1_end, trend_B2_end)
+# NOTE: Uses base R pipe (|>) compatible code (no { } blocks on RHS).
+# ============================================================================
+
+# Always create the columns so ggplot filters won't error
 df <- df |>
-  select(-any_of(c("trend_covid_surge", "trend_post_break2", "trend_inflection")))
+  mutate(
+    trend_B1_B2 = NA_real_,
+    trend_B2_B3 = NA_real_,
+    trend_B3_end = NA_real_,
+    trend_B1_end = NA_real_,
+    trend_B2_end = NA_real_
+  )
 
-# Add trend predictions for each segment between breaks
-if (nrow(all_breaks) >= 2) {
-  # B1 to B2
-  if (!is.null(segment_trends[["B1_to_B2"]])) {
-    df <- df |>
-      mutate(
-        trend_B1_B2 = if_else(
-          month >= segment_trends[["B1_to_B2"]]$start & month < segment_trends[["B1_to_B2"]]$end,
-          predict(segment_trends[["B1_to_B2"]]$fit, newdata = pick(everything())),
-          NA_real_
-        )
-      )
+add_segment_trend <- function(df, fit, colname, start_inclusive, end_exclusive = NULL) {
+  pred <- predict(fit, newdata = df)
+  in_range <- if (is.null(end_exclusive)) {
+    df$month >= start_inclusive
   } else {
-    df <- df |> mutate(trend_B1_B2 = NA_real_)
+    df$month >= start_inclusive & df$month < end_exclusive
   }
+  df[[colname]] <- ifelse(in_range, pred, NA_real_)
+  df
 }
 
-if (nrow(all_breaks) >= 3) {
-  # B2 to B3
-  if (!is.null(segment_trends[["B2_to_B3"]])) {
-    df <- df |>
-      mutate(
-        trend_B2_B3 = if_else(
-          month >= segment_trends[["B2_to_B3"]]$start & month < segment_trends[["B2_to_B3"]]$end,
-          predict(segment_trends[["B2_to_B3"]]$fit, newdata = pick(everything())),
-          NA_real_
-        )
-      )
-  } else {
-    df <- df |> mutate(trend_B2_B3 = NA_real_)
+# Helper: fit roll6 trend for a date range (base-pipe compatible)
+fit_roll_trend <- function(df, start_date, end_date = NULL) {
+  d <- df |>
+    filter(month >= start_date)
+
+  if (!is.null(end_date)) {
+    d <- d |>
+      filter(month < end_date)
   }
-  
-  # B3 to end
-  if (!is.null(segment_trends[["B3_to_end"]])) {
-    df <- df |>
-      mutate(
-        trend_B3_end = if_else(
-          month >= segment_trends[["B3_to_end"]]$start,
-          predict(segment_trends[["B3_to_end"]]$fit, newdata = pick(everything())),
-          NA_real_
-        )
-      )
-  } else {
-    df <- df |> mutate(trend_B3_end = NA_real_)
-  }
+
+  d <- d |>
+    filter(!is.na(roll6_100k), !is.na(month_num))
+
+  if (nrow(d) < 3) return(NULL)
+  lm(roll6_100k ~ month_num, data = d)
 }
 
-# B1 to end (full post-break trend)
-if (!is.null(segment_trends[["B1_to_end"]])) {
-  df <- df |>
-    mutate(
-      trend_B1_end = if_else(
-        month >= segment_trends[["B1_to_end"]]$start,
-        predict(segment_trends[["B1_to_end"]]$fit, newdata = pick(everything())),
-        NA_real_
-      )
+# Helper: safely fetch a segment fit from segment_trends
+get_segment_fit <- function(segment_trends, key) {
+  if (is.null(segment_trends[[key]])) return(NULL)
+  if (is.null(segment_trends[[key]]$fit)) return(NULL)
+  segment_trends[[key]]$fit
+}
+
+# Build the trend columns if breaks exist
+if (exists("all_breaks") && nrow(all_breaks) > 0) {
+
+  # ---- B1->B2 ----
+  if (nrow(all_breaks) >= 2) {
+    fit_b1_b2 <- get_segment_fit(segment_trends, "B1_to_B2")
+    if (is.null(fit_b1_b2)) {
+      fit_b1_b2 <- fit_roll_trend(df, all_breaks$month[1], all_breaks$month[2])
+    }
+    if (!is.null(fit_b1_b2)) {
+      df <- add_segment_trend(df, fit_b1_b2, "trend_B1_B2", all_breaks$month[1], all_breaks$month[2])
+    }
+  }
+
+  # ---- B2->B3 and B3->end ----
+  if (nrow(all_breaks) >= 3) {
+    fit_b2_b3 <- get_segment_fit(segment_trends, "B2_to_B3")
+    if (is.null(fit_b2_b3)) {
+      fit_b2_b3 <- fit_roll_trend(df, all_breaks$month[2], all_breaks$month[3])
+    }
+    if (!is.null(fit_b2_b3)) {
+      df <- add_segment_trend(df, fit_b2_b3, "trend_B2_B3", all_breaks$month[2], all_breaks$month[3])
+    }
+
+    # B3->end
+    fit_b3_end <- get_segment_fit(segment_trends, "B3_to_end")
+    if (is.null(fit_b3_end)) {
+      fit_b3_end <- get_segment_fit(segment_trends, sprintf("B%d_to_end", 3))
+    }
+    if (is.null(fit_b3_end)) {
+      fit_b3_end <- fit_roll_trend(df, all_breaks$month[3], NULL)
+    }
+    if (!is.null(fit_b3_end)) {
+      df <- add_segment_trend(df, fit_b3_end, "trend_B3_end", all_breaks$month[3], NULL)
+    }
+  }
+
+  # ---- B1->end (always) ----
+  fit_b1_end <- fit_roll_trend(df, all_breaks$month[1], NULL)
+  if (!is.null(fit_b1_end)) {
+    df <- add_segment_trend(df, fit_b1_end, "trend_B1_end", all_breaks$month[1], NULL)
+    segment_trends[["B1_to_end"]] <- list(
+      start = all_breaks$month[1],
+      end   = max(df$month, na.rm = TRUE),
+      slope = unname(coef(fit_b1_end)[2]) * 365.25,
+      fit   = fit_b1_end
     )
-} else {
-  df <- df |> mutate(trend_B1_end = NA_real_)
-}
+  }
 
-# B2 to end
-if (!is.null(segment_trends[["B2_to_end"]])) {
-  df <- df |>
-    mutate(
-      trend_B2_end = if_else(
-        month >= segment_trends[["B2_to_end"]]$start,
-        predict(segment_trends[["B2_to_end"]]$fit, newdata = pick(everything())),
-        NA_real_
+  # ---- B2->end (if exists) ----
+  if (nrow(all_breaks) >= 2) {
+    fit_b2_end <- fit_roll_trend(df, all_breaks$month[2], NULL)
+    if (!is.null(fit_b2_end)) {
+      df <- add_segment_trend(df, fit_b2_end, "trend_B2_end", all_breaks$month[2], NULL)
+      segment_trends[["B2_to_end"]] <- list(
+        start = all_breaks$month[2],
+        end   = max(df$month, na.rm = TRUE),
+        slope = unname(coef(fit_b2_end)[2]) * 365.25,
+        fit   = fit_b2_end
       )
-    )
-} else {
-  df <- df |> mutate(trend_B2_end = NA_real_)
+    }
+  }
 }
 
 # ============================================================================
 # VISUALIZATION
 # ============================================================================
-
-# ---- Marker dates (known events - static official markers) ----
 markers <- tibble(
   date = as.Date(c("2020-01-31", "2020-12-08", "2021-11-01", "2022-04-15")),
   short_label = c("COVID", "Vax start", "90% vax", "Full vax")
 )
 
-# Calculate y-positions for markers (staggered)
-y_range <- range(c(df$rate_100k, df$roll6_100k, df$trend_100k), na.rm = TRUE)
+y_range <- range(c(df$rate_100k, df$roll6_100k, df$norm_fit_roll6), na.rm = TRUE)
 y_top <- y_range[2]
 y_bottom <- y_range[1]
 
 markers <- markers |>
-  mutate(
-    y_label = if_else(row_number() %% 2 == 1, y_top * 0.98, y_top * 0.92)
-  )
+  mutate(y_label = if_else(row_number() %% 2 == 1, y_top * 0.98, y_top * 0.92))
 
-# ---- Color palette ----
+# Colors (kept close to your original)
 color_raw <- "grey50"
-color_rolling <- "#E69F00"  # Orange
-color_trend_2010 <- "#0072B2"  # Blue
-color_markers <- "#D55E00"  # Vermillion
-color_breaks <- "#CC79A7"  # Pink for structural breaks
-color_segment_1 <- "#E31A1C"  # Red for B1-B2
-color_segment_2 <- "#009E73"  # Teal for B2-B3
+color_rolling <- "#E69F00"
+color_baseline <- "#0072B2"
+color_markers <- "#D55E00"
+color_breaks <- "#CC79A7"
+color_segment_1 <- "#E31A1C"
+color_segment_2 <- "#009E73"
 color_segment_3 <- "#F0E442"
-color_B1_end <- "#7B3294"  # Purple for B1-end
-color_B2_end <- "#1B9E77"  # Dark teal for B2-end
-color_deviation <- "#666666"  # Grey for deviation labels
+color_B1_end <- "#7B3294"
+color_B2_end <- "#1B9E77"
+color_deviation <- "#666666"
 
-# ---- Create the plot ----
 p <- ggplot(df, aes(x = month)) +
   
-  # Confidence band for 2010-2018 projection
+  # Prediction band for projection period (rolling, approximate)
   geom_ribbon(
     data = df |> filter(period == "proj_2019_2025"),
-    aes(ymin = ci_low_100k, ymax = ci_high_100k),
-    fill = color_trend_2010, alpha = 0.15
+    aes(ymin = norm_pi_low_roll6, ymax = norm_pi_high_roll6),
+    fill = color_baseline, alpha = 0.10
   ) +
   
-  # Raw monthly data (subdued)
+  # Raw data (subdued)
   geom_line(aes(y = rate_100k), color = color_raw, linewidth = 0.8, alpha = 0.5) +
   
-  # 6-month rolling average (prominent)
+  # Rolling average (prominent)
   geom_line(aes(y = roll6_100k), color = color_rolling, linewidth = 1.5, na.rm = TRUE) +
   
-  # 2010-2018 trend (solid for fit period)
+  # Baseline expected (rolling): solid in fit period
   geom_line(
     data = df |> filter(period == "fit_2010_2018"),
-    aes(y = trend_100k),
-    color = color_trend_2010, linewidth = 1.4
+    aes(y = norm_fit_roll6),
+    color = color_baseline, linewidth = 1.4
   ) +
   
-  # 2010-2018 projection (dashed for projection period)
+  # Baseline expected (rolling): dashed in projection
   geom_line(
     data = df |> filter(period == "proj_2019_2025"),
-    aes(y = trend_100k),
-    color = color_trend_2010, linewidth = 1.4, linetype = "dashed"
+    aes(y = norm_fit_roll6),
+    color = color_baseline, linewidth = 1.4, linetype = "dashed"
   ) +
   
-  # Segment trend B1-B2 (if exists)
-  {
-    if ("trend_B1_B2" %in% names(df)) {
-      geom_line(
-        data = df |> filter(!is.na(trend_B1_B2)),
-        aes(y = trend_B1_B2),
-        color = color_segment_1, linewidth = 1.4, linetype = "solid"
-      )
-    }
-  } +
+  # Segment trend lines (first 3 segments styled like your original)
+  geom_line(
+    data = df |> filter(!is.na(trend_B1_B2)),
+    aes(y = trend_B1_B2),
+    color = color_segment_1, linewidth = 1.4
+  ) +
+  geom_line(
+    data = df |> filter(!is.na(trend_B2_B3)),
+    aes(y = trend_B2_B3),
+    color = color_segment_2, linewidth = 1.4
+  ) +
+  geom_line(
+    data = df |> filter(!is.na(trend_B3_end)),
+    aes(y = trend_B3_end),
+    color = color_segment_3, linewidth = 1.4
+  ) +
+  geom_line(
+    data = df |> filter(!is.na(trend_B1_end)),
+    aes(y = trend_B1_end),
+    color = color_B1_end, linewidth = 1.2, linetype = "dashed"
+  ) +
+  geom_line(
+    data = df |> filter(!is.na(trend_B2_end)),
+    aes(y = trend_B2_end),
+    color = color_B2_end, linewidth = 1.2, linetype = "dotdash"
+  ) +
   
-  # Segment trend B2-B3 (if exists)
-  {
-    if ("trend_B2_B3" %in% names(df)) {
-      geom_line(
-        data = df |> filter(!is.na(trend_B2_B3)),
-        aes(y = trend_B2_B3),
-        color = color_segment_2, linewidth = 1.4, linetype = "solid"
-      )
-    }
-  } +
-  
-  # Segment trend B3-end (if exists)
-  {
-    if ("trend_B3_end" %in% names(df)) {
-      geom_line(
-        data = df |> filter(!is.na(trend_B3_end)),
-        aes(y = trend_B3_end),
-        color = color_segment_3, linewidth = 1.4, linetype = "solid"
-      )
-    }
-  } +
-  
-  # B1 to end trend (dashed)
-  {
-    if ("trend_B1_end" %in% names(df)) {
-      geom_line(
-        data = df |> filter(!is.na(trend_B1_end)),
-        aes(y = trend_B1_end),
-        color = color_B1_end, linewidth = 1.2, linetype = "dashed"
-      )
-    }
-  } +
-  
-  # B2 to end trend (dashed)
-  {
-    if ("trend_B2_end" %in% names(df)) {
-      geom_line(
-        data = df |> filter(!is.na(trend_B2_end)),
-        aes(y = trend_B2_end),
-        color = color_B2_end, linewidth = 1.2, linetype = "dotdash"
-      )
-    }
-  } +
-  
-  # ALL deviation labels at local highs and lows
+  # Deviation labels at local extrema (vs baseline rolling)
   geom_label_repel(
     data = local_extrema,
     aes(x = month, y = roll6_100k, label = dev_label_extrema),
@@ -506,15 +598,13 @@ p <- ggplot(df, aes(x = month)) +
     seed = 42
   ) +
   
-  # Event markers (known dates - static official markers)
+  # Event markers
   geom_vline(
     data = markers,
     aes(xintercept = date),
     linetype = "dotted", linewidth = 0.8,
     color = color_markers, alpha = 0.7
   ) +
-  
-  # Event labels
   geom_label(
     data = markers,
     aes(x = date, y = y_label, label = short_label),
@@ -526,7 +616,7 @@ p <- ggplot(df, aes(x = month)) +
     label.size = 0.2
   ) +
   
-  # ALL structural breaks (vertical dashed lines with dates)
+  # Structural breaks
   {
     if (nrow(all_breaks) > 0) {
       list(
@@ -538,11 +628,11 @@ p <- ggplot(df, aes(x = month)) +
         ),
         geom_label(
           data = all_breaks |> mutate(
-            y_pos = if_else(row_number() %% 2 == 1, 
+            y_pos = if_else(row_number() %% 2 == 1,
                             y_bottom + (y_top - y_bottom) * 0.15,
                             y_bottom + (y_top - y_bottom) * 0.06),
-            label_text = sprintf("B%d %s\n%s", 
-                                 break_num, 
+            label_text = sprintf("B%d %s\n%s",
+                                 break_num,
                                  if_else(direction == "up", "↑", "↓"),
                                  format(month, "%b %Y"))
           ),
@@ -558,47 +648,37 @@ p <- ggplot(df, aes(x = month)) +
     }
   } +
   
-  # Scales
   scale_x_date(
     date_breaks = "2 years",
     date_labels = "%Y",
     expand = expansion(mult = c(0.02, 0.05))
   ) +
   scale_y_continuous(
-    limits = c(2000, NA),
     labels = label_comma(),
     expand = expansion(mult = c(0.02, 0.12))
   ) +
   
-  # Labels - dynamic subtitle based on detected breaks
   labs(
-    title = "NHS Sickness Absence Rate (England) - Structural Break Analysis",
-    subtitle = {
-      sub_parts <- c("Rolling avg (orange)", "2010-18 baseline (blue)")
-      if (nrow(all_breaks) >= 2) sub_parts <- c(sub_parts, "B1→B2 (red)")
-      if (nrow(all_breaks) >= 3) sub_parts <- c(sub_parts, "B2→B3 (teal)")
-      sub_parts <- c(sub_parts, "B1→end (purple dashed)", "Breaks (pink)")
-      paste(sub_parts, collapse = " | ")
-    },
+    title = "NHS Sickness Absence Rate (England) — Breaks vs 2010–2018 Norm",
+    subtitle = paste(
+      "Orange: 6-month rolling average",
+      "| Blue: baseline norm (2010–2018, seasonality-adjusted)",
+      "| Ribbon: ~95% prediction band (approx., rolled)",
+      "| Pink: structural breaks on deviation-from-norm",
+      sep = " "
+    ),
     x = NULL,
     y = "Sickness rate (per 100,000 staff)",
     caption = {
-      cap_parts <- sprintf("%d structural breaks detected", nrow(all_breaks))
-      cap_parts <- paste0(cap_parts, sprintf(" | Baseline: %+.0f/yr", slope_2010_2018))
-      if (!is.null(segment_trends[["B1_to_B2"]])) {
-        cap_parts <- paste0(cap_parts, sprintf(" | B1→B2: %+.0f/yr", segment_trends[["B1_to_B2"]]$slope))
-      }
-      if (!is.null(segment_trends[["B2_to_B3"]])) {
-        cap_parts <- paste0(cap_parts, sprintf(" | B2→B3: %+.0f/yr", segment_trends[["B2_to_B3"]]$slope))
-      }
-      if (!is.null(segment_trends[["B1_to_end"]])) {
-        cap_parts <- paste0(cap_parts, sprintf(" | B1→end: %+.0f/yr", segment_trends[["B1_to_end"]]$slope))
-      }
-      cap_parts
+      cap <- sprintf("%d structural breaks (BIC-optimal) | Baseline slope: %+.0f/yr",
+                     nrow(all_breaks), slope_2010_2018)
+      if (!is.null(segment_trends[["B1_to_B2"]])) cap <- paste0(cap, sprintf(" | B1→B2: %+.0f/yr", segment_trends[["B1_to_B2"]]$slope))
+      if (!is.null(segment_trends[["B2_to_B3"]])) cap <- paste0(cap, sprintf(" | B2→B3: %+.0f/yr", segment_trends[["B2_to_B3"]]$slope))
+      if (!is.null(segment_trends[["B1_to_end"]])) cap <- paste0(cap, sprintf(" | B1→end: %+.0f/yr", segment_trends[["B1_to_end"]]$slope))
+      cap
     }
   ) +
   
-  # Theme
   theme_minimal(base_size = 14) +
   theme(
     plot.title = element_text(size = 16, face = "bold", margin = margin(b = 5)),
@@ -613,12 +693,10 @@ p <- ggplot(df, aes(x = month)) +
     legend.position = "none"
   )
 
-# ---- Display plot ----
 print(p)
 
-# ---- Save high-resolution output ----
 ggsave(
-  "nhs_sickness_analysis_improved.png",
+  "nhs_sickness_analysis_fixed.png",
   plot = p,
   width = 16,
   height = 9,
@@ -626,36 +704,37 @@ ggsave(
   bg = "white"
 )
 
-cat("\nPlot saved as 'nhs_sickness_analysis_improved.png'\n")
+cat("\nPlot saved as 'nhs_sickness_analysis_fixed.png'\n")
 
 # ============================================================================
 # SUMMARY OUTPUT
 # ============================================================================
-
 cat("\n")
 cat("========================================================================\n")
-cat("               ANALYSIS SUMMARY                                        \n")
+cat("                          ANALYSIS SUMMARY                               \n")
 cat("========================================================================\n")
-cat(sprintf("Structural breaks detected: %d\n", nrow(all_breaks)))
+cat(sprintf("Structural breaks detected (BIC-optimal): %d\n", nrow(all_breaks)))
 if (nrow(all_breaks) > 0) {
   for (i in 1:nrow(all_breaks)) {
-    cat(sprintf("  Break %d: %s (%s)\n", 
-                i, 
+    cat(sprintf("  Break %d: %s (%s)\n",
+                i,
                 format(all_breaks$month[i], "%B %Y"),
                 if_else(all_breaks$direction[i] == "up", "upward", "downward")))
   }
 }
 cat("------------------------------------------------------------------------\n")
 cat("TREND SLOPES (per 100k per year):\n")
-cat(sprintf("  Baseline (2010-2018):     %+7.1f\n", slope_2010_2018))
+cat(sprintf("  Baseline norm (2010-2018): %+7.1f\n", slope_2010_2018))
 
-# Print all segment trends dynamically
-for (name in names(segment_trends)) {
-  trend <- segment_trends[[name]]
-  multiplier <- trend$slope / slope_2010_2018
-  cat(sprintf("  %-24s %+7.1f  (%.1fx baseline)\n", 
-              paste0(name, ":"),
-              trend$slope, 
-              multiplier))
+if (length(segment_trends) > 0) {
+  for (nm in names(segment_trends)) {
+    tr <- segment_trends[[nm]]
+    # guard against divide-by-zero if slope baseline is ~0
+    multiplier <- if (isTRUE(all.equal(slope_2010_2018, 0))) NA_real_ else tr$slope / slope_2010_2018
+    cat(sprintf("  %-24s %+7.1f  (%s)\n",
+                paste0(nm, ":"),
+                tr$slope,
+                ifelse(is.na(multiplier), "n/a vs baseline", sprintf("%.1fx baseline", multiplier))))
+  }
 }
 cat("========================================================================\n")
