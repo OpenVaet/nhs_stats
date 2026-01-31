@@ -203,6 +203,35 @@ df <- df |>
   )
 
 # ============================================================================
+# EXPORT: Monthly sickness rolling + prediction band (2020–2025)
+#   Output aligns with monthly positivity format: "YYYY-MM,value"
+# ============================================================================
+
+OUT_SICKNESS_BANDS <- "data/sickness_roll6_prediction_band_2020_2026.csv"
+
+df_sickness_monthly <- df |>
+  mutate(month_key = format(month, "%Y-%m")) |>
+  filter(month >= as.Date("2019-01-01"), month <= as.Date("2025-11-01")) |>
+  select(
+    month_key,
+    roll6_100k,
+    norm_pi_low_roll6,
+    norm_pi_high_roll6
+  ) |>
+  rename(
+    month = month_key,
+    sickness_roll6_100k = roll6_100k,
+    sickness_pred_low_100k = norm_pi_low_roll6,
+    sickness_pred_high_100k = norm_pi_high_roll6
+  ) |>
+  arrange(month)
+
+write.csv(df_sickness_monthly, OUT_SICKNESS_BANDS, row.names = FALSE)
+cat(sprintf("\nExported monthly sickness rolling + prediction band: %s\n", OUT_SICKNESS_BANDS))
+
+print(head(df_sickness_monthly, 24))
+
+# ============================================================================
 # STRUCTURAL BREAKS (Bai–Perron) ON DEVIATION-FROM-NORM (RAW)
 #   IMPORTANT FIX: refit a FULL breakpoints model with breaks=optimal_n
 #   so confint() works (no vcov error).
