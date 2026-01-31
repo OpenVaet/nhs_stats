@@ -57,7 +57,6 @@ H_FRACTION <- 0.10    # minimum 10% of data per segment
 # Breakpoint model choice:
 # - "level": step changes in deviation (dev_100k_raw ~ 1)
 # - "trend": changes in deviation trend (dev_100k_raw ~ month_num)
-# (You set this to "level" in your edit; keep it if you prefer level shifts)
 BP_MODEL_TYPE <- "level"
 
 # ---- Helpers ----
@@ -497,6 +496,7 @@ if (exists("all_breaks") && nrow(all_breaks) > 0) {
 # ============================================================================
 # VISUALIZATION
 # ============================================================================
+
 markers <- tibble(
   date = as.Date(c("2020-01-31", "2020-12-08", "2021-11-01", "2022-04-15")),
   short_label = c("COVID", "Vax start", "90% vax", "Full vax")
@@ -522,36 +522,67 @@ color_B1_end <- "#7B3294"
 color_B2_end <- "#1B9E77"
 color_deviation <- "#666666"
 
+# ---- X-axis guides: every 3 months + thicker Jan separators ----
+x_min <- floor_date(min(df$month, na.rm = TRUE), unit = "month")
+x_max <- ceiling_date(max(df$month, na.rm = TRUE), unit = "month")
+
+x_breaks_3m <- seq(x_min, x_max, by = "3 months")
+x_breaks_jan <- seq(floor_date(x_min, "year"), floor_date(x_max, "year"), by = "1 year")
+
+grid_3m <- tibble(x = x_breaks_3m)
+grid_jan <- tibble(x = x_breaks_jan)
+
+label_3m <- function(d) {
+  d <- as.Date(d)
+  ifelse(format(d, "%m") == "01", format(d, "%b\n%Y"), format(d, "%b"))
+}
+
 p <- ggplot(df, aes(x = month)) +
-  
+
+  # --- Month/year separators FIRST (so they stay behind everything) ---
+  geom_vline(
+    data = grid_3m,
+    aes(xintercept = x),
+    color = "grey92",
+    linetype = "dashed",
+    linewidth = 0.3
+  ) +
+  geom_vline(
+    data = grid_jan,
+    aes(xintercept = x),
+    color = "grey80",
+    linetype = "solid",
+    linewidth = 0.8
+  ) +
+
   # Prediction band for projection period (rolling, approximate)
   geom_ribbon(
     data = df |> filter(period == "proj_2019_2025"),
     aes(ymin = norm_pi_low_roll6, ymax = norm_pi_high_roll6),
     fill = color_baseline, alpha = 0.10
   ) +
-  
+
   # Raw data (subdued)
   geom_line(aes(y = rate_100k), color = color_raw, linewidth = 0.8, alpha = 0.5) +
-  
+
   # Rolling average (prominent)
   geom_line(aes(y = roll6_100k), color = color_rolling, linewidth = 1.5, na.rm = TRUE) +
-  
+
   # Baseline expected (rolling): solid in fit period
   geom_line(
     data = df |> filter(period == "fit_2010_2018"),
     aes(y = norm_fit_roll6),
     color = color_baseline, linewidth = 1.4
   ) +
-  
+
   # Baseline expected (rolling): dashed in projection
   geom_line(
     data = df |> filter(period == "proj_2019_2025"),
     aes(y = norm_fit_roll6),
     color = color_baseline, linewidth = 1.4, linetype = "dashed"
   ) +
-  
-  # Segment trend lines (first 3 segments styled like your original)
+
+  # Segment trend lines
   geom_line(
     data = df |> filter(!is.na(trend_B1_B2)),
     aes(y = trend_B1_B2),
@@ -577,8 +608,8 @@ p <- ggplot(df, aes(x = month)) +
     aes(y = trend_B2_end),
     color = color_B2_end, linewidth = 1.2, linetype = "dotdash"
   ) +
-  
-  # Deviation labels at local extrema (vs baseline rolling)
+
+  # Deviation labels at local extrema (NOW above month/year separators)
   geom_label_repel(
     data = local_extrema,
     aes(x = month, y = roll6_100k, label = dev_label_extrema),
@@ -597,7 +628,7 @@ p <- ggplot(df, aes(x = month)) +
     max.overlaps = 50,
     seed = 42
   ) +
-  
+
   # Event markers
   geom_vline(
     data = markers,
@@ -615,8 +646,8 @@ p <- ggplot(df, aes(x = month)) +
     label.padding = unit(0.12, "lines"),
     label.size = 0.2
   ) +
-  
-  # Structural breaks
+
+  # Structural breaks (kept above separators; and above labels if overlapping)
   {
     if (nrow(all_breaks) > 0) {
       list(
@@ -647,19 +678,19 @@ p <- ggplot(df, aes(x = month)) +
       )
     }
   } +
-  
+
   scale_x_date(
-    date_breaks = "2 years",
-    date_labels = "%Y",
+    breaks = x_breaks_3m,
+    labels = label_3m,
     expand = expansion(mult = c(0.02, 0.05))
   ) +
   scale_y_continuous(
     labels = label_comma(),
     expand = expansion(mult = c(0.02, 0.12))
   ) +
-  
+
   labs(
-    title = "NHS Sickness Absence Rate (England) — Breaks vs 2010–2018 Norm",
+    title = "NHS Sickness Absence Rate (England) - Breaks vs 2010-2018 Norm",
     subtitle = paste(
       "Orange: 6-month rolling average",
       "| Blue: baseline norm (2010–2018, seasonality-adjusted)",
@@ -678,18 +709,19 @@ p <- ggplot(df, aes(x = month)) +
       cap
     }
   ) +
-  
+
   theme_minimal(base_size = 14) +
   theme(
     plot.title = element_text(size = 16, face = "bold", margin = margin(b = 5)),
     plot.subtitle = element_text(size = 9, color = "grey40", margin = margin(b = 10)),
     plot.caption = element_text(size = 8, color = "grey50", hjust = 0, margin = margin(t = 10)),
-    axis.text = element_text(size = 10),
+    axis.text.x = element_text(size = 9, angle = 90, vjust = 0.5, hjust = 1),
+    axis.text.y = element_text(size = 10),
     axis.title.y = element_text(size = 11, margin = margin(r = 10)),
     panel.grid.minor = element_blank(),
-    panel.grid.major.x = element_line(color = "grey90", linewidth = 0.3),
+    panel.grid.major.x = element_blank(),
     panel.grid.major.y = element_line(color = "grey85", linewidth = 0.4),
-    plot.margin = margin(t = 10, r = 15, b = 10, l = 10),
+    plot.margin = margin(t = 10, r = 15, b = 25, l = 10),
     legend.position = "none"
   )
 
