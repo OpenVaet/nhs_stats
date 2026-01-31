@@ -1,13 +1,6 @@
 # ============================================================================
 # NHS Sickness Rate Analysis - Improved Visualization & Trend Detection
 # ============================================================================
-# 
-# This script:
-# 1. Improves visual readability (colors, annotations, layout)
-# 2. Detects the exact month of post-COVID trend inflection
-# 3. Adds a Nov 2021+ trend line in a distinct color
-#
-# ============================================================================
 
 # ---- Packages ----
 # install.packages(c("tidyverse", "lubridate", "slider", "scales", "ggrepel"))
@@ -65,86 +58,120 @@ df <- bind_cols(df, pred_all) |>
 
 
 # ============================================================================
-# REQUIREMENT 2: Detect ALL Structural Breaks (Residual-Based Heuristic)
+# REQUIREMENT 2: Detect ALL Structural Breaks (Bai-Perron)
 # ============================================================================
 # 
-# Strategy: Find ALL months where the 6-month rolling average changes regime
-# relative to the 2010-2018 trend projection. We detect transitions between
-# sustained above-trend and sustained below-trend periods.
+# Using the Bai-Perron (1998, 2003) structural break test via strucchange.
+# We detect ALL breaks that the algorithm finds optimal.
 #
-# This is an UNBIASED approach:
+# Configuration:
 # - Baseline: 2010-2018 (excludes any potential late-2019 contamination)
-# - Data: 6-month rolling average (smoothed, not raw)
-# - No limit on number of breaks detected
+# - Data: RAW monthly data (rate_100k) - not smoothed
+# - Model: Testing for level shifts (intercept-only model)
+# - No limit on number of breaks - let BIC decide
 #
 # ============================================================================
 
+library(strucchange)
+
 cat("\n========================================\n")
-cat("STRUCTURAL BREAK DETECTION (Heuristic)\n")
+cat("BAI-PERRON STRUCTURAL BREAK ANALYSIS\n")
 cat("========================================\n")
 cat("Baseline: 2010-2018 trend projection\n")
-cat("Data: 6-month rolling average\n")
-cat("Detecting ALL regime changes\n\n")
+cat("Data: RAW monthly data (not smoothed)\n")
+cat("Model: Level shifts (intercept-only)\n\n")
 
-# ---- Calculate residuals from 2010-2018 trend ----
-df <- df |>
-  mutate(
-    residual = roll6_100k - trend_100k,
-    above_trend = residual > 0
-  )
-
-# ---- Find ALL structural breaks ----
-# A break occurs when we transition between sustained above-trend and below-trend
-
-df_breaks <- df |>
-  filter(!is.na(roll6_100k), !is.na(above_trend)) |>
+# ---- Prepare data for Bai-Perron ----
+df_for_bp <- df |>
+  filter(!is.na(rate_100k)) |>
   arrange(month) |>
-  mutate(
-    # Count consecutive months above/below trend (looking backward)
-    consec_above = slide_dbl(above_trend, sum, .before = 5, .after = 0, .complete = TRUE),
-    consec_below = slide_dbl(!above_trend, sum, .before = 5, .after = 0, .complete = TRUE),
-    # Sustained states
-    sustained_above = consec_above >= 6,
-    sustained_below = consec_below >= 6,
-    # Previous states
-    prev_sustained_above = lag(sustained_above, default = FALSE),
-    prev_sustained_below = lag(sustained_below, default = FALSE),
-    # Detect transitions (break = first month of new sustained regime)
-    break_up = sustained_above & !prev_sustained_above,
-    break_down = sustained_below & !prev_sustained_below
+  mutate(row_idx = row_number())
+
+# ---- Fit Bai-Perron model ----
+# Using intercept-only model to detect level shifts on RAW data
+# h = 0.10 allows for more breaks (minimum 10% of data per segment)
+bp_model <- breakpoints(
+  rate_100k ~ 1,
+  data = df_for_bp,
+  h = 0.10,
+  breaks = 10  # Allow up to 10 breaks
+)
+
+# Summary
+cat("Breakpoint model summary:\n")
+print(summary(bp_model))
+
+# Get BIC-optimal number of breaks
+bp_summary <- summary(bp_model)
+cat("\nBIC by number of breaks:\n")
+print(bp_summary$RSS["BIC", , drop = FALSE])
+
+# Extract optimal breaks
+optimal_n <- which.min(bp_summary$RSS["BIC", ])
+if (names(optimal_n) == "0") {
+  optimal_n <- 0
+} else {
+  optimal_n <- as.numeric(names(optimal_n))
+}
+
+cat(sprintf("\nBIC-optimal number of breaks: %d\n", optimal_n))
+
+# Get the breakpoints for optimal solution
+if (optimal_n > 0) {
+  bp_optimal <- breakpoints(bp_model, breaks = optimal_n)
+  break_indices <- bp_optimal$breakpoints
+  
+  # Convert to dates
+  all_breaks <- tibble(
+    break_num = 1:length(break_indices),
+    row_idx = break_indices,
+    month = df_for_bp$month[break_indices]
   )
-
-# Extract all breaks
-breaks_up <- df_breaks |>
-  filter(break_up) |>
-  mutate(direction = "up") |>
-  select(month, direction, residual)
-
-breaks_down <- df_breaks |>
-  filter(break_down) |>
-  mutate(direction = "down") |>
-  select(month, direction, residual)
-
-all_breaks <- bind_rows(breaks_up, breaks_down) |>
-  arrange(month) |>
-  mutate(break_num = row_number())
-
-# ---- Report findings ----
-cat(sprintf("Found %d structural breaks:\n", nrow(all_breaks)))
-cat("----------------------------------------\n")
-
-if (nrow(all_breaks) > 0) {
+  
+  # Determine direction of each break (compare mean before vs after)
+  all_breaks <- all_breaks |>
+    mutate(
+      mean_before = map_dbl(row_idx, ~ mean(df_for_bp$rate_100k[max(1, .x - 6):(.x - 1)], na.rm = TRUE)),
+      mean_after = map_dbl(row_idx, ~ mean(df_for_bp$rate_100k[(.x + 1):min(nrow(df_for_bp), .x + 6)], na.rm = TRUE)),
+      direction = if_else(mean_after > mean_before, "up", "down")
+    )
+  
+  # Get confidence intervals
+  bp_confint <- confint(bp_model, breaks = optimal_n, level = 0.95)
+  
+  cat("\n----------------------------------------\n")
+  cat("DETECTED STRUCTURAL BREAKS:\n")
+  cat("----------------------------------------\n")
+  
   for (i in 1:nrow(all_breaks)) {
     direction_symbol <- if_else(all_breaks$direction[i] == "up", "↑ UP", "↓ DOWN")
+    ci_lower <- df_for_bp$month[bp_confint$confint[i, 1]]
+    ci_upper <- df_for_bp$month[bp_confint$confint[i, 3]]
     cat(sprintf("  Break %d: %s  %s\n", 
                 i,
                 format(all_breaks$month[i], "%B %Y"),
                 direction_symbol))
+    cat(sprintf("           95%% CI: [%s - %s]\n",
+                format(ci_lower, "%b %Y"),
+                format(ci_upper, "%b %Y")))
   }
+  
 } else {
-  cat("  No sustained breaks detected\n")
+  cat("\nNo structural breaks detected by BIC criterion.\n")
+  all_breaks <- tibble(
+    break_num = integer(),
+    row_idx = integer(),
+    month = as.Date(character()),
+    direction = character()
+  )
 }
+
 cat("========================================\n\n")
+
+# Also show segment means
+cat("Segment means (Bai-Perron):\n")
+segment_means <- coef(bp_model)
+print(segment_means)
 
 # For backward compatibility - use first two breaks if they exist
 inflection_month_1 <- if (nrow(all_breaks) >= 1) all_breaks$month[1] else NA
@@ -188,122 +215,164 @@ cat(sprintf("  - %d highs\n", sum(local_extrema$extrema_type == "high")))
 cat(sprintf("  - %d lows\n", sum(local_extrema$extrema_type == "low")))
 
 # ============================================================================
-# TREND LINES FOR EACH SEGMENT
+# CALCULATE ALL SEGMENT TRENDS
 # ============================================================================
 
-# --- Trend 1: November 2021+ (post-vaccine plateau) ---
-df_nov2021_plus <- df |>
-  filter(month >= as.Date("2021-11-01"), !is.na(roll6_100k))
+cat("\n========================================\n")
+cat("SEGMENT TREND ANALYSIS\n")
+cat("========================================\n")
 
-fit_nov2021 <- lm(roll6_100k ~ month_num, data = df_nov2021_plus)
+# Store all segment trends
+segment_trends <- list()
 
+if (nrow(all_breaks) >= 1) {
+  # Calculate trend for each segment between consecutive breaks
+  for (i in 1:(nrow(all_breaks))) {
+    start_date <- if (i == 1) min(df$month, na.rm = TRUE) else all_breaks$month[i]
+    end_date <- if (i == nrow(all_breaks)) max(df$month, na.rm = TRUE) else all_breaks$month[i + 1]
+    
+    segment_name <- sprintf("B%d_to_%s", i, if (i == nrow(all_breaks)) "end" else sprintf("B%d", i + 1))
+    
+    df_segment <- df |>
+      filter(month >= start_date, month < end_date, !is.na(roll6_100k))
+    
+    if (nrow(df_segment) >= 3) {
+      fit_segment <- lm(roll6_100k ~ month_num, data = df_segment)
+      slope <- coef(fit_segment)[2] * 365.25
+      segment_trends[[segment_name]] <- list(
+        start = start_date,
+        end = end_date,
+        slope = slope,
+        fit = fit_segment
+      )
+      cat(sprintf("  %s (%s to %s): %+.1f per 100k/year\n",
+                  segment_name,
+                  format(start_date, "%b %Y"),
+                  format(end_date, "%b %Y"),
+                  slope))
+    }
+  }
+  
+  # Also calculate cumulative trends from each break to end
+  cat("\nCumulative trends (break to end):\n")
+  for (i in 1:nrow(all_breaks)) {
+    start_date <- all_breaks$month[i]
+    end_date <- max(df$month, na.rm = TRUE)
+    
+    segment_name <- sprintf("B%d_to_end", i)
+    
+    df_segment <- df |>
+      filter(month >= start_date, !is.na(roll6_100k))
+    
+    if (nrow(df_segment) >= 3) {
+      fit_segment <- lm(roll6_100k ~ month_num, data = df_segment)
+      slope <- coef(fit_segment)[2] * 365.25
+      segment_trends[[segment_name]] <- list(
+        start = start_date,
+        end = end_date,
+        slope = slope,
+        fit = fit_segment
+      )
+      cat(sprintf("  %s (%s to %s): %+.1f per 100k/year\n",
+                  segment_name,
+                  format(start_date, "%b %Y"),
+                  format(end_date, "%b %Y"),
+                  slope))
+    }
+  }
+}
+
+# Pre-break baseline trend
+cat("\nBaseline trend:\n")
+cat(sprintf("  2010-2018: %+.1f per 100k/year\n", slope_2010_2018))
+
+cat("========================================\n\n")
+
+# ---- Add trend lines to dataframe for plotting ----
+# Clear any existing trend columns
 df <- df |>
-  mutate(
-    trend_nov2021 = if_else(
-      month >= as.Date("2021-11-01"),
-      predict(fit_nov2021, newdata = pick(everything())),
-      NA_real_
-    )
-  )
+  select(-any_of(c("trend_covid_surge", "trend_post_break2", "trend_inflection")))
 
-# --- Trend 2: COVID surge period (Break 1 to Break 2) ---
-if (!is.na(inflection_month_1) && !is.na(inflection_month_2)) {
-  df_covid_surge <- df |>
-    filter(month >= inflection_month_1, month < inflection_month_2, !is.na(roll6_100k))
-  
-  if (nrow(df_covid_surge) >= 3) {
-    fit_covid_surge <- lm(roll6_100k ~ month_num, data = df_covid_surge)
-    
+# Add trend predictions for each segment between breaks
+if (nrow(all_breaks) >= 2) {
+  # B1 to B2
+  if (!is.null(segment_trends[["B1_to_B2"]])) {
     df <- df |>
       mutate(
-        trend_covid_surge = if_else(
-          month >= inflection_month_1 & month < inflection_month_2,
-          predict(fit_covid_surge, newdata = pick(everything())),
+        trend_B1_B2 = if_else(
+          month >= segment_trends[["B1_to_B2"]]$start & month < segment_trends[["B1_to_B2"]]$end,
+          predict(segment_trends[["B1_to_B2"]]$fit, newdata = pick(everything())),
           NA_real_
         )
       )
-    slope_covid_surge <- coef(fit_covid_surge)[2] * 365.25
   } else {
-    df <- df |> mutate(trend_covid_surge = NA_real_)
-    slope_covid_surge <- NA_real_
+    df <- df |> mutate(trend_B1_B2 = NA_real_)
   }
-} else {
-  df <- df |> mutate(trend_covid_surge = NA_real_)
-  slope_covid_surge <- NA_real_
 }
 
-# --- Trend 3: Post-Break 2 to end ---
-if (!is.na(inflection_month_2)) {
-  df_post_break2 <- df |>
-    filter(month >= inflection_month_2, !is.na(roll6_100k))
-  
-  if (nrow(df_post_break2) >= 3) {
-    fit_post_break2 <- lm(roll6_100k ~ month_num, data = df_post_break2)
-    
+if (nrow(all_breaks) >= 3) {
+  # B2 to B3
+  if (!is.null(segment_trends[["B2_to_B3"]])) {
     df <- df |>
       mutate(
-        trend_post_break2 = if_else(
-          month >= inflection_month_2,
-          predict(fit_post_break2, newdata = pick(everything())),
+        trend_B2_B3 = if_else(
+          month >= segment_trends[["B2_to_B3"]]$start & month < segment_trends[["B2_to_B3"]]$end,
+          predict(segment_trends[["B2_to_B3"]]$fit, newdata = pick(everything())),
           NA_real_
         )
       )
-    slope_post_break2 <- coef(fit_post_break2)[2] * 365.25
   } else {
-    df <- df |> mutate(trend_post_break2 = NA_real_)
-    slope_post_break2 <- NA_real_
+    df <- df |> mutate(trend_B2_B3 = NA_real_)
   }
-} else {
-  df <- df |> mutate(trend_post_break2 = NA_real_)
-  slope_post_break2 <- NA_real_
+  
+  # B3 to end
+  if (!is.null(segment_trends[["B3_to_end"]])) {
+    df <- df |>
+      mutate(
+        trend_B3_end = if_else(
+          month >= segment_trends[["B3_to_end"]]$start,
+          predict(segment_trends[["B3_to_end"]]$fit, newdata = pick(everything())),
+          NA_real_
+        )
+      )
+  } else {
+    df <- df |> mutate(trend_B3_end = NA_real_)
+  }
 }
 
-# --- Trend 4: Full post-Break1 (Break 1 to end) - for comparison ---
-if (!is.na(inflection_month_1)) {
-  df_inflection_plus <- df |>
-    filter(month >= inflection_month_1, !is.na(roll6_100k))
-  
-  fit_inflection <- lm(roll6_100k ~ month_num, data = df_inflection_plus)
-  
+# B1 to end (full post-break trend)
+if (!is.null(segment_trends[["B1_to_end"]])) {
   df <- df |>
     mutate(
-      trend_inflection = if_else(
-        month >= inflection_month_1,
-        predict(fit_inflection, newdata = pick(everything())),
+      trend_B1_end = if_else(
+        month >= segment_trends[["B1_to_end"]]$start,
+        predict(segment_trends[["B1_to_end"]]$fit, newdata = pick(everything())),
         NA_real_
       )
     )
-  slope_inflection <- coef(fit_inflection)[2] * 365.25
 } else {
-  df <- df |> mutate(trend_inflection = NA_real_)
-  slope_inflection <- NA_real_
+  df <- df |> mutate(trend_B1_end = NA_real_)
 }
 
-# Report all trends
-slope_nov2021 <- coef(fit_nov2021)[2] * 365.25  # Annualized
-slope_2010_2018 <- coef(fit_2010_2018)[2] * 365.25
-
-cat("\n========================================\n")
-cat("TREND COMPARISON (Annualized Slopes)\n")
-cat("========================================\n")
-cat(sprintf("Pre-COVID (2010-2018):     %+7.1f per 100k per year\n", slope_2010_2018))
-if (!is.na(slope_covid_surge)) {
-  cat(sprintf("COVID surge (B1-B2):       %+7.1f per 100k per year\n", slope_covid_surge))
+# B2 to end
+if (!is.null(segment_trends[["B2_to_end"]])) {
+  df <- df |>
+    mutate(
+      trend_B2_end = if_else(
+        month >= segment_trends[["B2_to_end"]]$start,
+        predict(segment_trends[["B2_to_end"]]$fit, newdata = pick(everything())),
+        NA_real_
+      )
+    )
+} else {
+  df <- df |> mutate(trend_B2_end = NA_real_)
 }
-if (!is.na(slope_post_break2)) {
-  cat(sprintf("Post-Break2:               %+7.1f per 100k per year\n", slope_post_break2))
-}
-cat(sprintf("Nov 2021+ trend:           %+7.1f per 100k per year\n", slope_nov2021))
-if (!is.na(slope_inflection)) {
-  cat(sprintf("Full post-Break1:          %+7.1f per 100k per year\n", slope_inflection))
-}
-cat("========================================\n\n")
 
 # ============================================================================
 # VISUALIZATION
 # ============================================================================
 
-# ---- Marker dates (known events) ----
+# ---- Marker dates (known events - static official markers) ----
 markers <- tibble(
   date = as.Date(c("2020-01-31", "2020-12-08", "2021-11-01", "2022-04-15")),
   short_label = c("COVID", "Vax start", "90% vax", "Full vax")
@@ -323,11 +392,13 @@ markers <- markers |>
 color_raw <- "grey50"
 color_rolling <- "#E69F00"  # Orange
 color_trend_2010 <- "#0072B2"  # Blue
-color_trend_nov21 <- "#009E73"  # Teal/Green
 color_markers <- "#D55E00"  # Vermillion
 color_breaks <- "#CC79A7"  # Pink for structural breaks
-color_covid_surge <- "#E31A1C"  # Red
-color_trend_inflection <- "#7B3294"  # Purple
+color_segment_1 <- "#E31A1C"  # Red for B1-B2
+color_segment_2 <- "#009E73"  # Teal for B2-B3
+color_segment_3 <- "#F0E442"
+color_B1_end <- "#7B3294"  # Purple for B1-end
+color_B2_end <- "#1B9E77"  # Dark teal for B2-end
 color_deviation <- "#666666"  # Grey for deviation labels
 
 # ---- Create the plot ----
@@ -360,26 +431,60 @@ p <- ggplot(df, aes(x = month)) +
     color = color_trend_2010, linewidth = 1.4, linetype = "dashed"
   ) +
   
-  # November 2021+ trend
-  geom_line(
-    data = df |> filter(!is.na(trend_nov2021)),
-    aes(y = trend_nov2021),
-    color = color_trend_nov21, linewidth = 1.4, linetype = "solid"
-  ) +
+  # Segment trend B1-B2 (if exists)
+  {
+    if ("trend_B1_B2" %in% names(df)) {
+      geom_line(
+        data = df |> filter(!is.na(trend_B1_B2)),
+        aes(y = trend_B1_B2),
+        color = color_segment_1, linewidth = 1.4, linetype = "solid"
+      )
+    }
+  } +
   
-  # COVID surge trend (if exists)
-  geom_line(
-    data = df |> filter(!is.na(trend_covid_surge)),
-    aes(y = trend_covid_surge),
-    color = color_covid_surge, linewidth = 1.4, linetype = "solid"
-  ) +
+  # Segment trend B2-B3 (if exists)
+  {
+    if ("trend_B2_B3" %in% names(df)) {
+      geom_line(
+        data = df |> filter(!is.na(trend_B2_B3)),
+        aes(y = trend_B2_B3),
+        color = color_segment_2, linewidth = 1.4, linetype = "solid"
+      )
+    }
+  } +
   
-  # Full post-Break1 trend (purple dashed)
-  geom_line(
-    data = df |> filter(!is.na(trend_inflection)),
-    aes(y = trend_inflection),
-    color = color_trend_inflection, linewidth = 1.2, linetype = "dashed"
-  ) +
+  # Segment trend B3-end (if exists)
+  {
+    if ("trend_B3_end" %in% names(df)) {
+      geom_line(
+        data = df |> filter(!is.na(trend_B3_end)),
+        aes(y = trend_B3_end),
+        color = color_segment_3, linewidth = 1.4, linetype = "solid"
+      )
+    }
+  } +
+  
+  # B1 to end trend (dashed)
+  {
+    if ("trend_B1_end" %in% names(df)) {
+      geom_line(
+        data = df |> filter(!is.na(trend_B1_end)),
+        aes(y = trend_B1_end),
+        color = color_B1_end, linewidth = 1.2, linetype = "dashed"
+      )
+    }
+  } +
+  
+  # B2 to end trend (dashed)
+  {
+    if ("trend_B2_end" %in% names(df)) {
+      geom_line(
+        data = df |> filter(!is.na(trend_B2_end)),
+        aes(y = trend_B2_end),
+        color = color_B2_end, linewidth = 1.2, linetype = "dotdash"
+      )
+    }
+  } +
   
   # ALL deviation labels at local highs and lows
   geom_label_repel(
@@ -401,7 +506,7 @@ p <- ggplot(df, aes(x = month)) +
     seed = 42
   ) +
   
-  # Event markers (known dates)
+  # Event markers (known dates - static official markers)
   geom_vline(
     data = markers,
     aes(xintercept = date),
@@ -421,7 +526,7 @@ p <- ggplot(df, aes(x = month)) +
     label.size = 0.2
   ) +
   
-  # ALL structural breaks (vertical dashed lines)
+  # ALL structural breaks (vertical dashed lines with dates)
   {
     if (nrow(all_breaks) > 0) {
       list(
@@ -434,16 +539,20 @@ p <- ggplot(df, aes(x = month)) +
         geom_label(
           data = all_breaks |> mutate(
             y_pos = if_else(row_number() %% 2 == 1, 
-                            y_bottom + (y_top - y_bottom) * 0.12,
-                            y_bottom + (y_top - y_bottom) * 0.05),
-            label_text = sprintf("B%d %s", break_num, if_else(direction == "up", "↑", "↓"))
+                            y_bottom + (y_top - y_bottom) * 0.15,
+                            y_bottom + (y_top - y_bottom) * 0.06),
+            label_text = sprintf("B%d %s\n%s", 
+                                 break_num, 
+                                 if_else(direction == "up", "↑", "↓"),
+                                 format(month, "%b %Y"))
           ),
           aes(x = month, y = y_pos, label = label_text),
           color = color_breaks,
-          fill = alpha("white", 0.9),
-          size = 2.5,
+          fill = alpha("white", 0.92),
+          size = 2.3,
           fontface = "bold",
-          label.padding = unit(0.1, "lines")
+          label.padding = unit(0.12, "lines"),
+          lineheight = 0.9
         )
       )
     }
@@ -461,27 +570,39 @@ p <- ggplot(df, aes(x = month)) +
     expand = expansion(mult = c(0.02, 0.12))
   ) +
   
-  # Labels
+  # Labels - dynamic subtitle based on detected breaks
   labs(
     title = "NHS Sickness Absence Rate (England) - Structural Break Analysis",
-    subtitle = paste0(
-      "Rolling avg (orange) | 2010-18 baseline (blue) | COVID surge (red) | ",
-      "Nov 2021+ (green) | Breaks (pink dashed)"
-    ),
+    subtitle = {
+      sub_parts <- c("Rolling avg (orange)", "2010-18 baseline (blue)")
+      if (nrow(all_breaks) >= 2) sub_parts <- c(sub_parts, "B1→B2 (red)")
+      if (nrow(all_breaks) >= 3) sub_parts <- c(sub_parts, "B2→B3 (teal)")
+      sub_parts <- c(sub_parts, "B1→end (purple dashed)", "Breaks (pink)")
+      paste(sub_parts, collapse = " | ")
+    },
     x = NULL,
     y = "Sickness rate (per 100,000 staff)",
-    caption = paste0(
-      sprintf("%d structural breaks detected | ", nrow(all_breaks)),
-      sprintf("Baseline slope: %+.0f/yr | Nov 2021+: %+.0f/yr", 
-              slope_2010_2018, slope_nov2021)
-    )
+    caption = {
+      cap_parts <- sprintf("%d structural breaks detected", nrow(all_breaks))
+      cap_parts <- paste0(cap_parts, sprintf(" | Baseline: %+.0f/yr", slope_2010_2018))
+      if (!is.null(segment_trends[["B1_to_B2"]])) {
+        cap_parts <- paste0(cap_parts, sprintf(" | B1→B2: %+.0f/yr", segment_trends[["B1_to_B2"]]$slope))
+      }
+      if (!is.null(segment_trends[["B2_to_B3"]])) {
+        cap_parts <- paste0(cap_parts, sprintf(" | B2→B3: %+.0f/yr", segment_trends[["B2_to_B3"]]$slope))
+      }
+      if (!is.null(segment_trends[["B1_to_end"]])) {
+        cap_parts <- paste0(cap_parts, sprintf(" | B1→end: %+.0f/yr", segment_trends[["B1_to_end"]]$slope))
+      }
+      cap_parts
+    }
   ) +
   
   # Theme
   theme_minimal(base_size = 14) +
   theme(
     plot.title = element_text(size = 16, face = "bold", margin = margin(b = 5)),
-    plot.subtitle = element_text(size = 10, color = "grey40", margin = margin(b = 10)),
+    plot.subtitle = element_text(size = 9, color = "grey40", margin = margin(b = 10)),
     plot.caption = element_text(size = 8, color = "grey50", hjust = 0, margin = margin(t = 10)),
     axis.text = element_text(size = 10),
     axis.title.y = element_text(size = 11, margin = margin(r = 10)),
@@ -526,19 +647,15 @@ if (nrow(all_breaks) > 0) {
 }
 cat("------------------------------------------------------------------------\n")
 cat("TREND SLOPES (per 100k per year):\n")
-cat(sprintf("  Pre-COVID (2010-2018):    %+7.1f\n", slope_2010_2018))
-if (!is.na(slope_covid_surge)) {
-  cat(sprintf("  COVID surge (B1-B2):      %+7.1f  (%.1fx baseline)\n", 
-              slope_covid_surge, slope_covid_surge/slope_2010_2018))
-}
-if (!is.na(slope_post_break2)) {
-  cat(sprintf("  Post-Break2:              %+7.1f  (%.1fx baseline)\n", 
-              slope_post_break2, slope_post_break2/slope_2010_2018))
-}
-cat(sprintf("  Nov 2021+:                %+7.1f  (%.1fx baseline)\n", 
-            slope_nov2021, slope_nov2021/slope_2010_2018))
-if (!is.na(slope_inflection)) {
-  cat(sprintf("  Full post-Break1:         %+7.1f  (%.1fx baseline)\n", 
-              slope_inflection, slope_inflection/slope_2010_2018))
+cat(sprintf("  Baseline (2010-2018):     %+7.1f\n", slope_2010_2018))
+
+# Print all segment trends dynamically
+for (name in names(segment_trends)) {
+  trend <- segment_trends[[name]]
+  multiplier <- trend$slope / slope_2010_2018
+  cat(sprintf("  %-24s %+7.1f  (%.1fx baseline)\n", 
+              paste0(name, ":"),
+              trend$slope, 
+              multiplier))
 }
 cat("========================================================================\n")
