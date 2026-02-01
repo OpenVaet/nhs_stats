@@ -271,7 +271,7 @@ p <- ggplot(df, aes(x = month)) +
   ) +
 
   labs(
-    title = "NHS sickness vs vaccine doses administered",
+    title = "NHS staff's sickness vs Vaccine doses administered",
     subtitle = "Dark grey: sickness rate | Stacked bars: monthly doses (1st/2nd/3rd)",
     x = NULL
   ) +
