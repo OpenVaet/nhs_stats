@@ -215,11 +215,13 @@ df_sickness_monthly <- df |>
   select(
     month_key,
     roll6_100k,
+    rate_100k,
     norm_pi_low_roll6,
     norm_pi_high_roll6
   ) |>
   rename(
     month = month_key,
+    sickness_rate_100k = rate_100k,
     sickness_roll6_100k = roll6_100k,
     sickness_pred_low_100k = norm_pi_low_roll6,
     sickness_pred_high_100k = norm_pi_high_roll6
@@ -528,7 +530,7 @@ if (exists("all_breaks") && nrow(all_breaks) > 0) {
 
 markers <- tibble(
   date = as.Date(c("2020-01-31", "2020-12-08", "2021-11-01", "2022-04-15")),
-  short_label = c("COVID", "Vax start", "90% vax", "Full vax")
+  short_label = c("COVID", "Vax start", "90% vax & Mandates", "Drop Mandates")
 )
 
 y_range <- range(c(df$rate_100k, df$roll6_100k, df$norm_fit_roll6), na.rm = TRUE)
@@ -544,7 +546,7 @@ color_rolling <- "#E69F00"
 color_baseline <- "#0072B2"
 color_markers <- "#D55E00"
 color_breaks <- "#CC79A7"
-color_segment_1 <- "#E31A1C"
+color_segment_1 <- "#7B3294"
 color_segment_2 <- "#009E73"
 color_segment_3 <- "#F0E442"
 color_B1_end <- "#7B3294"
