@@ -3,131 +3,307 @@ library(readr)
 library(dplyr)
 library(stringr)
 library(ggplot2)
+library(lubridate)
+library(scales)
 
-# ---- 1) Load both files ----
+# ---- 1) Load files ----
 deaths <- read_csv("data/deaths_in_service_long.csv",
                    col_types = cols(
                      year_from_to = col_character(),
-                     quarter      = col_character(),
+                     quarter      = col_character(),  # "Q1".."Q4"
                      deaths       = col_double()
                    ))
 
 denoms <- read_csv("data/april_denominators_2011_2025.csv",
                    col_types = cols(
-                     period      = col_character(),
+                     period      = col_character(),   # "201004 to 201104"
                      denominator = col_double()
                    ))
 
-# Helper: convert "YYYY-YY" (e.g. "2011-12", "2019-20") -> end year as integer (2012, 2020)
+qs <- read_csv("data/yearly_quarters_positivity_doses_and_sickness.csv",
+               col_types = cols(
+                 fiscal_year = col_character(),
+                 fiscal_quarter = col_character(),
+                 positivity_mean_quarter = col_double(),
+                 doses_sum_quarter = col_double(),
+                 sickness_mean_quarter = col_double()
+               ))
+
+# Helper: convert "YYYY-YY" -> end year as integer (2012, 2020)
 year_from_to_to_end_year <- function(x) {
-  start_year <- as.integer(str_sub(x, 1, 4))
-  end_two    <- as.integer(str_sub(x, 6, 7))
-  # assume 2000s for typical data (11..26 etc); adjust if ever needed
-  end_year   <- if_else(end_two < 50L, 2000L + end_two, 1900L + end_two)
-  
-  # sanity: if something like 1999-00 appears, the above still works (end_year=2000)
-  end_year
+  end_two  <- as.integer(str_sub(x, 6, 7))
+  if_else(end_two < 50L, 2000L + end_two, 1900L + end_two)
 }
 
-# ---- 2) Concatenate yearly deaths (sum Q1..Q4 per year_from_to) ----
-yearly_deaths <- deaths %>%
-  group_by(year_from_to) %>%
-  summarise(deaths_year = sum(deaths, na.rm = TRUE), .groups = "drop") %>%
+# Helper: "Q1".."Q4" -> 1..4
+quarter_to_num <- function(q) {
+  as.integer(str_remove(str_to_upper(q), "Q"))
+}
+
+# Helper: get quarter start date for an NHS financial-year quarter
+# Q1=Apr (start FY), Q2=Jul, Q3=Oct of (year_end-1), Q4=Jan of (year_end)
+quarter_start_date <- function(year_end, q_num) {
+  start_year <- if_else(q_num == 4L, year_end, year_end - 1L)
+  start_month <- case_when(
+    q_num == 1L ~ 4L,
+    q_num == 2L ~ 7L,
+    q_num == 3L ~ 10L,
+    TRUE        ~ 1L
+  )
+  as.Date(sprintf("%04d-%02d-01", start_year, start_month))
+}
+
+# ---- 2) Build quarterly deaths dataset ----
+q_dat <- deaths %>%
   mutate(
     year_end = year_from_to_to_end_year(year_from_to),
-    # ---- 3) Build the denominator period key per your rule:
-    # for 2011 -> "201004 to 201104", for 2012 -> "201104 to 201204", etc.
-    period = sprintf("%d04 to %d04", year_end - 1L, year_end)
+    q_num    = quarter_to_num(quarter),
+    
+    # Denominator key: FY April->April
+    period   = sprintf("%d04 to %d04", year_end - 1L, year_end),
+    
+    # Regression time (financial-year-based)
+    time_num = (year_end - 1L) + (q_num - 1L) / 4,
+    
+    # Quarter start date for plotting
+    q_start  = quarter_start_date(year_end, q_num)
   )
 
-# ---- 3) Join denominators ----
-dat <- yearly_deaths %>%
-  left_join(denoms, by = "period")
-
-# ---- 4) Calculate yearly normalized deaths per 100,000 ----
-dat <- dat %>%
+# ---- 3) Join denominators + quarterly positivity/doses/sickness ----
+dat <- q_dat %>%
+  left_join(denoms, by = "period") %>%
   mutate(
-    rate_per_100k = (deaths_year / denominator) * 100000
+    rate_per_100k = (deaths / denominator) * 100000
+  ) %>%
+  left_join(
+    qs,
+    by = c("year_from_to" = "fiscal_year", "quarter" = "fiscal_quarter")
+  ) %>%
+  arrange(year_end, q_num) %>%
+  mutate(
+    period_q = paste0(year_from_to, " ", quarter),
+    period_q = factor(period_q, levels = unique(period_q))
   )
 
-# ---- Fit linear trend on 2011–2019 ----
-trend_fit <- lm(rate_per_100k ~ year_end, data = dat %>% filter(year_end >= 2011, year_end <= 2019))
+# ---- Fit linear trend on 2011–2019 (quarterly points) ----
+trend_fit <- lm(
+  rate_per_100k ~ time_num,
+  data = dat %>% filter(year_end >= 2011, year_end <= 2019)
+)
 
-# Prediction for all available years
 pred_df <- dat %>%
-  distinct(year_end, year_from_to) %>%
-  arrange(year_end) %>%
+  distinct(period_q, q_start, year_end, q_num, time_num) %>%
+  arrange(year_end, q_num) %>%
   mutate(pred_rate = predict(trend_fit, newdata = .))
 
-# Join predictions and compute excess %
 dat2 <- dat %>%
-  left_join(pred_df %>% select(year_end, pred_rate), by = "year_end") %>%
+  left_join(pred_df %>% select(period_q, pred_rate), by = "period_q") %>%
   mutate(excess_pct = (rate_per_100k - pred_rate) / pred_rate * 100)
 
-# Labels for excess % (years 2021–2025 only)
+# Labels (keep as before; you can switch to Q4-only if too busy)
 excess_labels <- dat2 %>%
   filter(year_end >= 2021, year_end <= 2025) %>%
   mutate(label = sprintf("%+.1f%%", excess_pct))
 
-# Ensure year interval is ordered chronologically on the x-axis
-dat2 <- dat2 %>%
-  arrange(year_end) %>%
-  mutate(year_from_to = factor(year_from_to, levels = unique(year_from_to)))
-
 pred_df <- pred_df %>%
-  arrange(year_end) %>%
-  mutate(year_from_to = factor(year_from_to, levels = levels(dat2$year_from_to)))
+  mutate(period_q = factor(period_q, levels = levels(dat2$period_q)))
 
-# Split trend into solid (<=2019) and dashed (>=2020)
-pred_solid <- pred_df %>% filter(year_end <= 2019)
+pred_solid  <- pred_df %>% filter(year_end <= 2019)
 pred_dashed <- pred_df %>% filter(year_end >= 2020)
 
-# ---- Line chart: actual + trend solid then dashed ----
-p <- ggplot(dat2, aes(x = year_from_to)) +
-  # Actual series
-  geom_line(aes(y = rate_per_100k, group = 1), linewidth = 1.4) +
-  geom_point(aes(y = rate_per_100k), size = 2.8) +
+# =============================================================================
+# Axis scaling (aligned to the monthly script style)
+# LEFT axis  = deaths per 100k
+# RIGHT axis = doses_sum_quarter (starts at 0), drawn as bars scaled to left axis
+# Positivity & sickness are drawn as lines scaled onto left axis
+# =============================================================================
+
+left_min_raw <- min(dat2$rate_per_100k, na.rm = TRUE)
+left_max_raw <- max(dat2$rate_per_100k, na.rm = TRUE)
+pad <- 0.06 * (left_max_raw - left_min_raw)
+left_min <- left_min_raw - pad
+left_max <- left_max_raw + pad
+
+max_doses_q <- max(dat2$doses_sum_quarter, na.rm = TRUE)
+if (!is.finite(max_doses_q) || max_doses_q <= 0) {
+  max_doses_q <- NA_real_
+}
+k_dose <- if (!is.na(max_doses_q)) (left_max - left_min) / max_doses_q else NA_real_
+
+max_pos_q <- max(dat2$positivity_mean_quarter, na.rm = TRUE)
+k_pos <- if (is.finite(max_pos_q) && max_pos_q > 0) (left_max - left_min) / max_pos_q else NA_real_
+
+max_sick_q <- max(dat2$sickness_mean_quarter, na.rm = TRUE)
+k_sick <- if (is.finite(max_sick_q) && max_sick_q > 0) (left_max - left_min) / max_sick_q else NA_real_
+
+dat2 <- dat2 %>%
+  mutate(
+    # bars for doses (scaled to left axis)
+    doses_scaled = if (!is.na(k_dose)) left_min + doses_sum_quarter * k_dose else NA_real_,
+    
+    # red positivity line (scaled)
+    pos_scaled = if (!is.na(k_pos)) left_min + positivity_mean_quarter * k_pos else NA_real_,
+    
+    # optional sickness line (scaled)
+    sick_scaled = if (!is.na(k_sick)) left_min + sickness_mean_quarter * k_sick else NA_real_
+  )
+
+# =============================================================================
+# Background shading + vertical separators (quarterly)
+# =============================================================================
+
+PLOT_START <- as.Date(min(dat2$q_start, na.rm = TRUE))
+PLOT_END   <- as.Date(max(dat2$q_start, na.rm = TRUE))
+
+# periods like the monthly script
+periods_bg <- tibble(
+  period = c("no_tests", "corr_high", "corr_none"),
+  xmin   = ymd(c(format(PLOT_START, "%Y-%m-%d"), "2020-05-01", "2022-05-01")),
+  xmax   = ymd(c("2020-05-01", "2022-05-01", format(PLOT_END %m+% months(4), "%Y-%m-%d"))),
+  fill   = c("#EEEEEE", "#DFF2E1", "#F6DADA")
+)
+
+# vertical grid: every quarter + thicker April separators (FY start)
+x_min <- floor_date(PLOT_START, unit = "month")
+x_max <- ceiling_date(PLOT_END %m+% months(3), unit = "month")
+
+x_breaks_q  <- seq(x_min, x_max, by = "3 months")     # quarter starts
+x_breaks_apr <- seq(ymd(sprintf("%d-04-01", year(x_min) - 1L)),
+                    ymd(sprintf("%d-04-01", year(x_max) + 1L)),
+                    by = "1 year")
+
+grid_q   <- tibble(x = x_breaks_q)
+grid_apr <- tibble(x = x_breaks_apr)
+
+label_q <- function(d) {
+  # label each quarter start as "Qx\nYYYY" (FY quarter)
+  # simple: show month+year like the other plot
+  format(as.Date(d), "%b\n%Y")
+}
+
+# =============================================================================
+# Colors (same palette logic)
+# =============================================================================
+color_deaths <- "grey25"
+color_pos    <- "#D55E00"  # red/orange
+color_sick   <- "grey40"
+
+color_dose_bar <- "#56B4E9"  # single dose bar color
+
+# =============================================================================
+# Plot (aligned style with the monthly chart)
+# =============================================================================
+
+p <- ggplot(dat2, aes(x = q_start)) +
+  
+  # Background shading
+  geom_rect(
+    data = periods_bg,
+    aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill),
+    inherit.aes = FALSE,
+    alpha = 0.70
+  ) +
+  scale_fill_identity() +
+  
+  # Quarter separators + FY (April) separators
+  geom_vline(
+    data = grid_q,
+    aes(xintercept = x),
+    color = "grey92", linetype = "dashed", linewidth = 0.3
+  ) +
+  geom_vline(
+    data = grid_apr,
+    aes(xintercept = x),
+    color = "grey80", linetype = "solid", linewidth = 0.8
+  ) +
+  
+  # Doses bars (scaled onto left axis)
+  geom_rect(
+    aes(
+      xmin = q_start - days(35), xmax = q_start + days(35),
+      ymin = left_min, ymax = doses_scaled
+    ),
+    fill = color_dose_bar, alpha = 0.55, na.rm = TRUE
+  ) +
+  
+  # Positivity scaled (red)
+  geom_line(
+    aes(y = pos_scaled),
+    color = color_pos, linewidth = 1.1, na.rm = TRUE
+  ) +
+  
+  # Optional sickness scaled (grey, dashed) — remove if you don’t want it
+  geom_line(
+    aes(y = sick_scaled),
+    color = color_sick, linewidth = 1.0, linetype = "dashed", na.rm = TRUE
+  ) +
+  
+  # Deaths line (actual)
+  geom_line(
+    aes(y = rate_per_100k),
+    color = color_deaths, linewidth = 1.4, na.rm = TRUE
+  ) +
+  geom_point(aes(y = rate_per_100k), size = 2.2, color = color_deaths, na.rm = TRUE) +
   
   # Trend (solid 2011–2019)
   geom_line(
     data = pred_solid,
-    aes(y = pred_rate, group = 1),
+    aes(x = q_start, y = pred_rate, group = 1),
     color = "red",
-    linewidth = 1.4
+    linewidth = 1.2
   ) +
-  
   # Trend (dashed 2020+)
   geom_line(
     data = pred_dashed,
-    aes(y = pred_rate, group = 1),
+    aes(x = q_start, y = pred_rate, group = 1),
     color = "red",
     linetype = "dashed",
-    linewidth = 1.4
+    linewidth = 1.2
   ) +
   
-  # Excess % labels for 2021–2025
+  # Excess labels
   geom_text(
     data = excess_labels,
-    aes(y = rate_per_100k, label = label),
-    vjust = -0.9,
-    size = 4
+    aes(x = q_start, y = rate_per_100k, label = label),
+    vjust = -0.8,
+    size = 3.2
+  ) +
+  
+  scale_x_date(
+    breaks = x_breaks_q,
+    labels = label_q,
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  
+  scale_y_continuous(
+    limits = c(left_min, left_max),
+    labels = label_comma(),
+    name = "Deaths per 100,000 (quarterly, normalized by April denominator)",
+    sec.axis = sec_axis(
+      ~ if (!is.na(k_dose)) pmax(0, (. - left_min) / k_dose) else .,
+      name = "Vaccine doses administered (quarterly sum)",
+      breaks = if (is.na(max_doses_q)) waiver() else pretty(c(0, max_doses_q), n = 6),
+      labels = label_number(scale_cut = cut_short_scale())
+    )
   ) +
   
   labs(
-    x = "Year interval",
-    y = "Deaths per 100,000 (normalized by April year start denominator)",
-    title = "NHS Staff, Yearly Deaths per 100,000",
-    subtitle = "Red line: solid on linear trend fit 2011–2019, dashed from 2020; labels show excess vs trend for 2021–2025"
+    title = "NHS Staff: Quarterly Deaths vs Vaccine doses, Positivity & Sickness",
+    subtitle = "Grey: deaths | Blue bars: doses (quarterly sum) | Red: positivity (scaled) | Grey dashed: sickness (scaled) | Trend: 2011–2019 then dashed from 2020",
+    x = NULL
   ) +
-  scale_y_continuous(limits = c(1, 150), breaks = seq(0, 150, by = 10)) +
+  
   theme_minimal(base_size = 14) +
   theme(
-    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
-    axis.text.y = element_text(size = 12),
-    axis.title  = element_text(size = 14),
-    plot.title  = element_text(size = 16, face = "bold"),
-    plot.subtitle = element_text(size = 13),
-    panel.grid.minor = element_blank()
+    plot.title = element_text(size = 16, face = "bold", margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 9, color = "grey40", margin = margin(b = 10)),
+    axis.text.x = element_text(size = 9, angle = 90, vjust = 0.5, hjust = 1),
+    axis.title.y = element_text(size = 11, margin = margin(r = 10)),
+    axis.title.y.right = element_text(size = 11, margin = margin(l = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "grey85", linewidth = 0.4),
+    legend.position = "none"
   )
 
 print(p)
