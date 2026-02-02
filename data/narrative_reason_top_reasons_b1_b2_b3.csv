@@ -1,0 +1,31 @@
+period,reason_grp,mean_pct
+B1_to_B2 (2019-09 .. 2021-05),S10 Anxiety/stress/depression/other psychiatric illnesses,26.723776693192164
+B1_to_B2 (2019-09 .. 2021-05),Others,10.549317194144354
+B1_to_B2 (2019-09 .. 2021-05),S12 Other musculoskeletal problems,8.752124293678708
+B1_to_B2 (2019-09 .. 2021-05),S13 Cold Cough Flu - Influenza,7.874295846926353
+B1_to_B2 (2019-09 .. 2021-05),S25 Gastrointestinal problems,6.6877762762435236
+B1_to_B2 (2019-09 .. 2021-05),S98 Other known causes - not elsewhere classified,6.276219354684588
+B1_to_B2 (2019-09 .. 2021-05),S15 Chest & respiratory problems,6.0902050737984315
+B1_to_B2 (2019-09 .. 2021-05),S27 Infectious diseases,5.137749502530344
+B1_to_B2 (2019-09 .. 2021-05),S11 Back Problems,5.03936414040655
+B1_to_B2 (2019-09 .. 2021-05),S28 Injury fracture,4.983296171152952
+B2_to_B3 (2021-05 .. 2022-12),S10 Anxiety/stress/depression/other psychiatric illnesses,24.23982582708814
+B2_to_B3 (2021-05 .. 2022-12),S13 Cold Cough Flu - Influenza,9.862063738222757
+B2_to_B3 (2021-05 .. 2022-12),Others,9.82824850537623
+B2_to_B3 (2021-05 .. 2022-12),S12 Other musculoskeletal problems,8.366309506243645
+B2_to_B3 (2021-05 .. 2022-12),S27 Infectious diseases,7.943951550126136
+B2_to_B3 (2021-05 .. 2022-12),S15 Chest & respiratory problems,7.0719566742765805
+B2_to_B3 (2021-05 .. 2022-12),S25 Gastrointestinal problems,6.683815621286309
+B2_to_B3 (2021-05 .. 2022-12),S98 Other known causes - not elsewhere classified,6.0333170623854215
+B2_to_B3 (2021-05 .. 2022-12),S28 Injury fracture,4.624426640637831
+B2_to_B3 (2021-05 .. 2022-12),S11 Back Problems,4.386678174647686
+post_B3 (> 2022-12),S10 Anxiety/stress/depression/other psychiatric illnesses,26.74129396298814
+post_B3 (> 2022-12),Others,11.19181983112366
+post_B3 (> 2022-12),S13 Cold Cough Flu - Influenza,10.608193478541729
+post_B3 (> 2022-12),S12 Other musculoskeletal problems,9.164418676001056
+post_B3 (> 2022-12),S25 Gastrointestinal problems,8.143077360024709
+post_B3 (> 2022-12),S98 Other known causes - not elsewhere classified,6.373273529656825
+post_B3 (> 2022-12),S28 Injury fracture,5.009516259358515
+post_B3 (> 2022-12),S11 Back Problems,4.357957386456358
+post_B3 (> 2022-12),S15 Chest & respiratory problems,4.015320500739591
+post_B3 (> 2022-12),S26 Genitourinary & gynaecological disorders,3.530573846655536

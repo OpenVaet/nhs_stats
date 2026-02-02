@@ -1,0 +1,46 @@
+=== Narrative stats verification (TOTAL sickness % / positivity / doses) ===
+
+# A tibble: 3 × 21
+  period   months sick_mean_pct sick_min_pct sick_max_pct sick_sd_pct sick_slope_per_month sick_peak_month sick_peak_pct pos_months_present pos_months_total pos_mean_pct
+  <chr>     <int>         <dbl>        <dbl>        <dbl>       <dbl>                <dbl> <date>                  <dbl>              <int>            <int>        <dbl>
+1 B1_to_B…     21      1731236.    1487744.      2260231.  228133.                 9.15e+2 2020-04-01           2260231.                 16               21         6.66
+2 B2_to_B…     20      1401128.         99.8     2712929. 1078911.                -1.36e+5 2022-01-01           2712929.                 20               20         8.89
+3 post_B3…     33          100.         99.8         100.       0.146              8.02e-4 2025-01-01               100.                 33               33         8.62
+# ℹ 9 more variables: pos_peak_month <date>, pos_peak_pct <dbl>, r_pos_vs_sick <dbl>, dose_months_nonzero <int>, dose_mean <dbl>, dose_peak_month <date>,
+#   dose_peak <dbl>, dose_slope_per_month <dbl>, r_dose_vs_sick <dbl>
+
+=== Top reasons by average share (per period) ===
+
+# A tibble: 30 × 3
+   period                        reason_grp                                                mean_pct
+   <chr>                         <fct>                                                        <dbl>
+ 1 B1_to_B2 (2019-09 .. 2021-05) S10 Anxiety/stress/depression/other psychiatric illnesses    26.7 
+ 2 B1_to_B2 (2019-09 .. 2021-05) Others                                                       10.5 
+ 3 B1_to_B2 (2019-09 .. 2021-05) S12 Other musculoskeletal problems                            8.75
+ 4 B1_to_B2 (2019-09 .. 2021-05) S13 Cold Cough Flu - Influenza                                7.87
+ 5 B1_to_B2 (2019-09 .. 2021-05) S25 Gastrointestinal problems                                 6.69
+ 6 B1_to_B2 (2019-09 .. 2021-05) S98 Other known causes - not elsewhere classified             6.28
+ 7 B1_to_B2 (2019-09 .. 2021-05) S15 Chest & respiratory problems                              6.09
+ 8 B1_to_B2 (2019-09 .. 2021-05) S27 Infectious diseases                                       5.14
+ 9 B1_to_B2 (2019-09 .. 2021-05) S11 Back Problems                                             5.04
+10 B1_to_B2 (2019-09 .. 2021-05) S28 Injury fracture                                           4.98
+11 B2_to_B3 (2021-05 .. 2022-12) S10 Anxiety/stress/depression/other psychiatric illnesses    24.2 
+12 B2_to_B3 (2021-05 .. 2022-12) S13 Cold Cough Flu - Influenza                                9.86
+13 B2_to_B3 (2021-05 .. 2022-12) Others                                                        9.83
+14 B2_to_B3 (2021-05 .. 2022-12) S12 Other musculoskeletal problems                            8.37
+15 B2_to_B3 (2021-05 .. 2022-12) S27 Infectious diseases                                       7.94
+16 B2_to_B3 (2021-05 .. 2022-12) S15 Chest & respiratory problems                              7.07
+17 B2_to_B3 (2021-05 .. 2022-12) S25 Gastrointestinal problems                                 6.68
+18 B2_to_B3 (2021-05 .. 2022-12) S98 Other known causes - not elsewhere classified             6.03
+19 B2_to_B3 (2021-05 .. 2022-12) S28 Injury fracture                                           4.62
+20 B2_to_B3 (2021-05 .. 2022-12) S11 Back Problems                                             4.39
+21 post_B3 (> 2022-12)           S10 Anxiety/stress/depression/other psychiatric illnesses    26.7 
+22 post_B3 (> 2022-12)           Others                                                       11.2 
+23 post_B3 (> 2022-12)           S13 Cold Cough Flu - Influenza                               10.6 
+24 post_B3 (> 2022-12)           S12 Other musculoskeletal problems                            9.16
+25 post_B3 (> 2022-12)           S25 Gastrointestinal problems                                 8.14
+26 post_B3 (> 2022-12)           S98 Other known causes - not elsewhere classified             6.37
+27 post_B3 (> 2022-12)           S28 Injury fracture                                           5.01
+28 post_B3 (> 2022-12)           S11 Back Problems                                             4.36
+29 post_B3 (> 2022-12)           S15 Chest & respiratory problems                              4.02
+30 post_B3 (> 2022-12)           S26 Genitourinary & gynaecological disorders                  3.53
