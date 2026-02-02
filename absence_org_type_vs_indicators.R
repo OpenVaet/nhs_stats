@@ -408,3 +408,256 @@ readr::write_csv(merged_out, out_csv)
 
 cat("\nMerged monthly dataset saved as: ", out_csv, "\n", sep = "")
 cat(sprintf("Rows: %d | Columns: %d\n", nrow(merged_out), ncol(merged_out)))
+
+# =============================================================================
+# Stats verification for narrative (B1/B2/B3 periods)
+# =============================================================================
+
+B1 <- as.Date("2019-09-01")
+B2 <- as.Date("2021-05-01")
+B3 <- as.Date("2022-12-01")
+
+# Use the monthly totals + joined series we already built
+df_stats <- df_line |>
+  arrange(month) |>
+  mutate(
+    # month index for "per-month" slope
+    idx = row_number() - 1L
+  )
+
+# Helper: safe correlation
+safe_cor <- function(x, y) {
+  if (sum(is.finite(x) & is.finite(y)) < 3) return(NA_real_)
+  cor(x, y, use = "complete.obs")
+}
+
+# Helper: linear slope per month (y ~ idx) inside a period
+slope_per_month <- function(df, ycol) {
+  y <- df[[ycol]]
+  if (sum(is.finite(y)) < 3) return(NA_real_)
+  coef(lm(y ~ idx, data = df))[2]
+}
+
+# Helper: get peak value + month
+peak_info <- function(df, ycol) {
+  y <- df[[ycol]]
+  if (!any(is.finite(y))) return(tibble(peak_month = as.Date(NA), peak_value = NA_real_))
+  i <- which.max(y)
+  tibble(peak_month = df$month[i], peak_value = y[i])
+}
+
+# Period slicer
+slice_period <- function(df, start, end, inclusive_end = TRUE) {
+  if (is.na(end)) {
+    df |> filter(month > start)
+  } else if (inclusive_end) {
+    df |> filter(month >= start, month <= end)
+  } else {
+    df |> filter(month >= start, month < end)
+  }
+}
+
+# Summarise a period (matches the narrative style stats)
+summarise_period <- function(df, label) {
+  # Sickness stats
+  sick_mean <- mean(df$total_rate_100k, na.rm = TRUE)
+  sick_min  <- min(df$total_rate_100k, na.rm = TRUE)
+  sick_max  <- max(df$total_rate_100k, na.rm = TRUE)
+  sick_sd   <- sd(df$total_rate_100k, na.rm = TRUE)
+  sick_slope <- slope_per_month(df, "total_rate_100k")
+  sick_peak  <- peak_info(df, "total_rate_100k")
+
+  # Positivity stats (coverage + peak + correlation)
+  pos_non_na <- sum(is.finite(df$pos_monthly))
+  pos_n      <- nrow(df)
+  pos_mean   <- mean(df$pos_monthly, na.rm = TRUE)
+  pos_peak   <- peak_info(df, "pos_monthly")
+  r_pos_sick <- safe_cor(df$pos_monthly, df$total_rate_100k)
+
+  # Doses stats (including zeros, like your merged series)
+  dose_non_zero <- sum(df$total_doses > 0, na.rm = TRUE)
+  dose_mean     <- mean(df$total_doses, na.rm = TRUE)
+  dose_peak     <- peak_info(df, "total_doses")
+  dose_slope    <- slope_per_month(df, "total_doses")
+  r_dose_sick   <- safe_cor(df$total_doses, df$total_rate_100k)
+
+  tibble(
+    period = label,
+    months = nrow(df),
+
+    sick_mean_100k = sick_mean,
+    sick_min_100k  = sick_min,
+    sick_max_100k  = sick_max,
+    sick_sd_100k   = sick_sd,
+    sick_slope_per_month = sick_slope,
+    sick_peak_month = sick_peak$peak_month,
+    sick_peak_100k   = sick_peak$peak_value,
+
+    pos_months_present = pos_non_na,
+    pos_months_total   = pos_n,
+    pos_mean_pct       = pos_mean,
+    pos_peak_month     = pos_peak$peak_month,
+    pos_peak_pct       = pos_peak$peak_value,
+    r_pos_vs_sick      = r_pos_sick,
+
+    dose_months_nonzero = dose_non_zero,
+    dose_mean           = dose_mean,
+    dose_peak_month     = dose_peak$peak_month,
+    dose_peak           = dose_peak$peak_value,
+    dose_slope_per_month = dose_slope,
+    r_dose_vs_sick      = r_dose_sick
+  )
+}
+
+# Build 3 periods (inclusive ends for B1->B2 and B2->B3; post-B3 is strictly after)
+df_p1 <- slice_period(df_stats, B1, B2, inclusive_end = TRUE)
+df_p2 <- slice_period(df_stats, B2, B3, inclusive_end = TRUE)
+df_p3 <- slice_period(df_stats, B3, NA, inclusive_end = TRUE)  # month > B3
+
+stats_tbl <- bind_rows(
+  summarise_period(df_p1, "B1_to_B2 (2019-09 .. 2021-05)"),
+  summarise_period(df_p2, "B2_to_B3 (2021-05 .. 2022-12)"),
+  summarise_period(df_p3, "post_B3 (> 2022-12)")
+)
+
+cat("\n=== Narrative stats verification (totals / positivity / doses) ===\n")
+print(stats_tbl)
+
+# Also: Org Type shares (average share of total sickness rate, by period)
+# share = contrib_rate_100k / total_rate_100k, averaged over months
+share_by_period <- function(start, end, label, inclusive_end = TRUE) {
+  # monthly total for share denominator
+  totals <- month_totals |>
+    filter(if (is.na(end)) month > start else if (inclusive_end) month >= start & month <= end else month >= start & month < end) |>
+    select(month, total_rate_100k)
+
+  sick_stack |>
+    inner_join(totals, by = "month") |>
+    mutate(share = if_else(total_rate_100k > 0, contrib_rate_100k / total_rate_100k, NA_real_)) |>
+    group_by(org_type) |>
+    summarise(
+      share_mean = mean(share, na.rm = TRUE),
+      contrib_mean_100k = mean(contrib_rate_100k, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(share_mean)) |>
+    mutate(period = label) |>
+    select(period, org_type, share_mean, contrib_mean_100k)
+}
+
+org_shares <- bind_rows(
+  share_by_period(B1, B2, "B1_to_B2 (2019-09 .. 2021-05)", inclusive_end = TRUE),
+  share_by_period(B2, B3, "B2_to_B3 (2021-05 .. 2022-12)", inclusive_end = TRUE),
+  share_by_period(B3, NA, "post_B3 (> 2022-12)")
+)
+
+cat("\n=== Top Org Types by average share of sickness rate (per period) ===\n")
+org_shares |>
+  group_by(period) |>
+  slice_head(n = 8) |>
+  ungroup() |>
+  print(n = Inf)
+
+# Optional: export these verification tables to CSV for audit trail
+dir.create("data", showWarnings = FALSE, recursive = TRUE)
+readr::write_csv(stats_tbl,  "data/narrative_stats_verification_b1_b2_b3.csv")
+readr::write_csv(org_shares, "data/narrative_orgtype_shares_b1_b2_b3.csv")
+
+cat("\nWrote:\n- data/narrative_stats_verification_b1_b2_b3.csv\n- data/narrative_orgtype_shares_b1_b2_b3.csv\n")
+
+# =============================================================================
+# Sanity print (matches the narrative windows + rounding)
+# =============================================================================
+
+library(dplyr)
+
+# Narrative windows (as used in the verification)
+P1_START <- as.Date("2019-09-01"); P1_END <- as.Date("2021-04-01")  # B1 .. just before B2
+P2_START <- as.Date("2021-05-01"); P2_END <- as.Date("2022-11-01")  # B2 .. just before B3
+P3_START <- as.Date("2022-12-01"); P3_END <- as.Date("2024-12-01")  # from B3 onward (in export)
+
+safe_cor <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) < 3) return(NA_real_)
+  cor(x[ok], y[ok])
+}
+
+peak_row <- function(df, col) {
+  v <- df[[col]]
+  if (!any(is.finite(v))) return(tibble(month = as.Date(NA), value = NA_real_))
+  i <- which.max(v)
+  tibble(month = df$month[i], value = v[i])
+}
+
+fmt_int <- function(x) ifelse(is.finite(x), format(round(x), big.mark = ","), "NA")
+fmt_1   <- function(x) ifelse(is.finite(x), sprintf("%.1f", x), "NA")
+fmt_2   <- function(x) ifelse(is.finite(x), sprintf("%.2f", x), "NA")
+
+summ_period <- function(df, label) {
+  df <- df %>% arrange(month)
+  df <- df %>% mutate(idx = row_number() - 1L)
+
+  # Sickness
+  sick_mean <- mean(df$total_rate_100k, na.rm = TRUE)
+  sick_min  <- min(df$total_rate_100k, na.rm = TRUE)
+  sick_max  <- max(df$total_rate_100k, na.rm = TRUE)
+  sick_sd   <- sd(df$total_rate_100k, na.rm = TRUE)
+  sick_slope <- if (sum(is.finite(df$total_rate_100k)) >= 3)
+    coef(lm(total_rate_100k ~ idx, data = df))[2] else NA_real_
+  sick_peak <- peak_row(df, "total_rate_100k")
+
+  # Positivity
+  pos_present <- sum(is.finite(df$pos_monthly))
+  pos_total   <- nrow(df)
+  pos_mean <- mean(df$pos_monthly, na.rm = TRUE)
+  pos_peak <- peak_row(df, "pos_monthly")
+  r_pos_sick <- safe_cor(df$pos_monthly, df$total_rate_100k)
+
+  # Doses
+  dose_nonzero <- sum(df$total_doses > 0, na.rm = TRUE)
+  dose_mean <- mean(df$total_doses, na.rm = TRUE)
+  dose_peak <- peak_row(df, "total_doses")
+  dose_slope <- if (sum(is.finite(df$total_doses)) >= 3)
+    coef(lm(total_doses ~ idx, data = df))[2] else NA_real_
+  r_dose_sick <- safe_cor(df$total_doses, df$total_rate_100k)
+
+  cat("\n============================================================\n")
+  cat(label, "\n")
+  cat("Months:", min(df$month), "to", max(df$month), "| n =", nrow(df), "\n\n")
+
+  cat("Sickness rate (per 100k FTE-days available)\n")
+  cat("  mean:", fmt_int(sick_mean),
+      "| min:", fmt_int(sick_min),
+      "| max:", fmt_int(sick_max),
+      "| SD:",  fmt_int(sick_sd),
+      "| slope/month:", fmt_1(sick_slope), "\n")
+  cat("  peak:", format(sick_peak$month, "%Y-%m"), "=", fmt_int(sick_peak$value), "\n\n")
+
+  cat("Test positivity\n")
+  cat("  coverage:", pos_present, "/", pos_total,
+      "| mean:", fmt_2(pos_mean), "%\n")
+  cat("  peak:", format(pos_peak$month, "%Y-%m"), "=", fmt_2(pos_peak$value), "%\n")
+  cat("  corr(positivity, sickness) r =", fmt_2(r_pos_sick), "\n\n")
+
+  cat("Vaccination doses (monthly)\n")
+  cat("  non-zero months:", dose_nonzero,
+      "| mean:", fmt_int(dose_mean),
+      "| slope/month:", fmt_int(dose_slope), "\n")
+  cat("  peak:", format(dose_peak$month, "%Y-%m"), "=", fmt_int(dose_peak$value), "\n")
+  cat("  corr(doses, sickness) r =", fmt_2(r_dose_sick), "\n")
+}
+
+# Use df_line as the source (month_totals + total_doses + pos_monthly)
+df0 <- df_line %>% filter(month >= as.Date("2019-01-01"), month <= as.Date("2024-12-01"))
+
+p1 <- df0 %>% filter(month >= P1_START, month <= P1_END)
+p2 <- df0 %>% filter(month >= P2_START, month <= P2_END)
+p3 <- df0 %>% filter(month >= P3_START, month <= P3_END)
+
+summ_period(p1, "B1 -> pre-B2 (2019-09 .. 2021-04)")
+summ_period(p2, "B2 -> pre-B3 (2021-05 .. 2022-11)")
+summ_period(p3, "Post B3 (2022-12 .. 2024-12)")
+
+# Extra sanity: when do doses stop being non-zero?
+last_nonzero <- df0 %>% filter(total_doses > 0) %>% summarise(last = max(month, na.rm = TRUE)) %>% pull(last)
+cat("\nLast month with non-zero doses in df_line:", ifelse(is.finite(last_nonzero), format(last_nonzero, "%Y-%m"), "none"), "\n")
