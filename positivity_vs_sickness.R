@@ -164,6 +164,13 @@ cor_block <- function(dat, label) {
   invisible(list(pearson = pear, spearman = spear, n = n))
 }
 
+# Helper to format p-values nicely
+fmt_p <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 1e-4) return(sprintf("%.1e", p))
+  sprintf("%.4f", p)
+}
+
 # --- Define periods (inclusive bounds) ---
 p1_start <- as.Date("2020-05-01")
 p1_end   <- as.Date("2022-04-01")
@@ -211,44 +218,52 @@ corr_labels <- tibble(
 stopifnot(!anyNA(corr_labels$x), !anyNA(corr_labels$y), !anyNA(corr_labels$label))
 print(corr_labels)
 
-# ============================================================================
-# VISUALIZATION
-# ============================================================================
+# =====================================================================
+# VISUALIZATION — Substack/print friendly (bigger fonts, cleaner x-axis)
+# =====================================================================
 
-# ---- Breakpoints (hard-coded) + labels (pink dashed + label) ----
+# ---- Helper: format p-values nicely (used in corr_labels) ----
+fmt_p <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 1e-4) return(sprintf("%.1e", p))
+  sprintf("%.4f", p)
+}
+
+# ---- Palette (self-contained) ----
+color_rolling  <- "#E69F00"  # sickness roll6
+color_baseline <- "#0072B2"  # sickness prediction band
+color_markers  <- "#D55E00"  # event markers
+color_breaks   <- "#CC79A7"  # B1/B2/B3
+color_pos      <- "#D55E00"  # positivity line (same family as markers)
+color_tests    <- "grey70"   # test bars
+
+# ---- Breakpoints (hard-coded) + labels ----
 all_breaks <- tibble(
   break_num = 1:3,
   month = as.Date(c("2019-09-01", "2021-05-01", "2022-12-01"))
 ) |>
-  mutate(label_text = sprintf("B%d\n%s", break_num, format(month, "%b %Y")))
+  mutate(label_text = sprintf("B%d  %s", break_num, format(month, "%b %Y")))
 
 # ---- Event markers ----
 markers <- tibble(
   date = as.Date(c("2020-01-31", "2020-12-08", "2021-11-01", "2022-04-15")),
-  short_label = c("COVID", "Vax start", "90% vax & Mandates", "Drop Mandates")
+  short_label = c("COVID", "Vax start", "90% vax & mandates", "Mandates dropped")
 )
 
 y_top <- left_max
 markers <- markers |>
   mutate(y_label = if_else(row_number() %% 2 == 1, y_top * 0.985, y_top * 0.94))
 
-# ---- X-axis: every 3 months + thicker Jan separators ----
+# ---- X-axis: keep only January separators; label every 6 months ----
 x_min <- floor_date(min(df$month, na.rm = TRUE), unit = "month")
 x_max <- ceiling_date(max(df$month, na.rm = TRUE), unit = "month")
-
-x_breaks_3m <- seq(x_min, x_max, by = "3 months")
 x_breaks_jan <- seq(floor_date(x_min, "year"), floor_date(x_max, "year"), by = "1 year")
-
-grid_3m <- tibble(x = x_breaks_3m)
 grid_jan <- tibble(x = x_breaks_jan)
 
-label_3m <- function(d) {
-  format(as.Date(d), "%b\n%Y")   # e.g., "May\n2021"
-}
-
-# ============================================================================
+# =====================================================================
 # Background shading for periods + correlation labels
-# ============================================================================
+# =====================================================================
+
 periods_bg <- tibble(
   period = c("no_tests", "corr_high", "corr_none"),
   xmin   = ymd(c(format(PLOT_START, "%Y-%m-%d"), "2020-05-01", "2022-05-01")),
@@ -256,24 +271,39 @@ periods_bg <- tibble(
   fill   = c("#EEEEEE", "#DFF2E1", "#F6DADA")  # light grey, light green, light red
 )
 
-# Sanity checks: if these fail, ggplot will silently drop rows
 stopifnot(all(!is.na(periods_bg$xmin)), all(!is.na(periods_bg$xmax)))
 stopifnot(all(periods_bg$xmax > periods_bg$xmin))
 
-# Helper to format p-values nicely
-fmt_p <- function(p) {
-  if (is.na(p)) return("NA")
-  if (p < 1e-4) return(sprintf("%.1e", p))
-  sprintf("%.4f", p)
-}
+# ---- Correlation label boxes (built from res_p1/res_p2 computed above) ----
+corr_labels <- tibble(
+  period = c("corr_high", "corr_none"),
+  xmin   = ymd(c("2020-05-01", "2022-05-01")),
+  xmax   = ymd(c("2022-05-01", format(PLOT_END %m+% months(1), "%Y-%m-%d")))
+) |>
+  mutate(
+    x = as.Date((as.numeric(xmin) + as.numeric(xmax)) / 2, origin = "1970-01-01"),
+    y = c(
+      min(5250, left_max - 0.20 * (left_max - left_min)),
+      left_max - 0.18 * (left_max - left_min)
+    ),
+    label = c(
+      sprintf(
+        "Correlation (May 2020–Apr 2022)\nPearson r=%.3f (p=%s)\nSpearman ρ=%.3f (p=%s)\nN=%d",
+        unname(res_p1$pearson$estimate), fmt_p(res_p1$pearson$p.value),
+        unname(res_p1$spearman$estimate), fmt_p(res_p1$spearman$p.value),
+        res_p1$n
+      ),
+      sprintf(
+        "Correlation (May 2022–%s)\nPearson r=%.3f (p=%s)\nSpearman ρ=%.3f (p=%s)\nN=%d",
+        format(PLOT_END, "%b %Y"),
+        unname(res_p2$pearson$estimate), fmt_p(res_p2$pearson$p.value),
+        unname(res_p2$spearman$estimate), fmt_p(res_p2$spearman$p.value),
+        res_p2$n
+      )
+    )
+  )
 
-# ---- Colors (same palette) ----
-color_rolling  <- "#E69F00"  # orange
-color_baseline <- "#0072B2"  # blue
-color_markers  <- "#D55E00"  # orange/red (markers)
-color_breaks   <- "#CC79A7"  # pink
-color_pos      <- "#D55E00"  # red line for positivity
-color_tests    <- "grey70"   # neutral bars
+stopifnot(!anyNA(corr_labels$x), !anyNA(corr_labels$y), !anyNA(corr_labels$label))
 
 p <- ggplot(df, aes(x = month)) +
 
@@ -286,16 +316,12 @@ p <- ggplot(df, aes(x = month)) +
   ) +
   scale_fill_identity() +
 
-  # --- Month/year separators FIRST (behind everything) ---
-  geom_vline(
-    data = grid_3m,
-    aes(xintercept = x),
-    color = "grey92", linetype = "dashed", linewidth = 0.3
-  ) +
+  # --- Year separators (behind everything) ---
   geom_vline(
     data = grid_jan,
     aes(xintercept = x),
-    color = "grey80", linetype = "solid", linewidth = 0.8
+    color = "grey85",
+    linewidth = 0.7
   ) +
 
   # --- Tests performed band (bars + vertical labels) ---
@@ -306,7 +332,7 @@ p <- ggplot(df, aes(x = month)) +
   geom_text(
     aes(x = month, y = tests_label_y, label = tests_label),
     angle = 90,
-    size = 2.5,
+    size = 3.2,
     color = "grey20",
     na.rm = TRUE
   ) +
@@ -314,79 +340,79 @@ p <- ggplot(df, aes(x = month)) +
   # Prediction interval (blue ribbon)
   geom_ribbon(
     aes(ymin = sickness_pred_low_100k, ymax = sickness_pred_high_100k),
-    fill = color_baseline, alpha = 0.12
+    fill = color_baseline, alpha = 0.14
   ) +
 
   # Sickness rolling (orange)
   geom_line(
     aes(y = sickness_roll6_100k),
-    color = color_rolling, linewidth = 1.5, na.rm = TRUE
+    color = color_rolling, linewidth = 2.0, na.rm = TRUE
   ) +
 
   # Positivity rolling (red), scaled
   geom_line(
     aes(y = pos_scaled),
-    color = color_pos, linewidth = 1.2, na.rm = TRUE
+    color = color_pos, linewidth = 1.6, na.rm = TRUE
   ) +
 
-  # Event markers (orange dashed vertical lines)
+  # Event markers
   geom_vline(
     data = markers,
     aes(xintercept = date),
-    linetype = "dashed", linewidth = 0.9,
+    linetype = "dashed", linewidth = 1.0,
     color = color_markers, alpha = 0.75
   ) +
   geom_label(
     data = markers,
     aes(x = date, y = y_label, label = short_label),
     color = color_markers,
-    fill = alpha("white", 0.9),
-    size = 2.8,
+    fill = alpha("white", 0.92),
+    size = 3.6,
     fontface = "bold",
-    label.padding = unit(0.12, "lines"),
-    label.size = 0.2
+    label.padding = unit(0.18, "lines"),
+    label.size = 0.25
   ) +
 
-  # Structural breaks (pink dashed) + labels
+  # Structural breaks + labels
   geom_vline(
     data = all_breaks,
     aes(xintercept = month),
-    linetype = "longdash", linewidth = 1.0,
+    linetype = "longdash", linewidth = 1.2,
     color = color_breaks, alpha = 0.85
   ) +
   geom_label(
     data = all_breaks |>
       mutate(
         y_pos = if_else(row_number() %% 2 == 1,
-                        left_min + (left_max - left_min) * 0.35,
-                        left_min + (left_max - left_min) * 0.25)
+                        left_min + (left_max - left_min) * 0.40,
+                        left_min + (left_max - left_min) * 0.30)
       ),
     aes(x = month, y = y_pos, label = label_text),
     color = color_breaks,
-    fill = alpha("white", 0.92),
-    size = 2.3,
+    fill = alpha("white", 0.93),
+    size = 3.0,
     fontface = "bold",
-    label.padding = unit(0.12, "lines"),
-    lineheight = 0.9
+    label.padding = unit(0.18, "lines"),
+    lineheight = 0.95
   ) +
 
-  # --- Correlation labels in background (top area) ---
+  # Correlation labels
   geom_label(
     data = corr_labels,
     aes(x = x, y = y, label = label),
     inherit.aes = FALSE,
-    fill = alpha("white", 0.88),
+    fill = alpha("white", 0.90),
     color = "grey20",
-    size = 2.8,
-    label.size = 0.2,
-    label.padding = unit(0.15, "lines"),
-    lineheight = 0.95
+    size = 3.4,
+    label.size = 0.25,
+    label.padding = unit(0.20, "lines"),
+    lineheight = 0.98
   ) +
-  
+
   scale_x_date(
-    breaks = x_breaks_3m,
-    labels = label_3m,
-    expand = expansion(mult = c(0.02, 0.05))
+    date_breaks = "6 months",
+    date_labels = "%b\n%Y",
+    expand = expansion(mult = c(0.01, 0.03))
   ) +
 
   scale_y_continuous(
@@ -402,36 +428,34 @@ p <- ggplot(df, aes(x = month)) +
 
   labs(
     title = "NHS sickness vs COVID positivity (England)",
-    subtitle = paste(
-      "Blue band: predicted interval | Orange: sickness roll6 (-3..+2) | Red: positivity roll6 (-3..+2)",
-      "| Grey bars: PCR tests (monthly mean of 7-day totals) | Start: 2020-05",
-      sep = " "
-    ),
+    subtitle = "Blue band: prediction interval | Orange: sickness roll6 | Red: PCR positivity roll6 | Grey bars: PCR testing volume",
     x = NULL
   ) +
 
-  theme_minimal(base_size = 14) +
+  theme_minimal(base_size = 18) +
   theme(
-    plot.title = element_text(size = 16, face = "bold", margin = margin(b = 5)),
-    plot.subtitle = element_text(size = 9, color = "grey40", margin = margin(b = 10)),
-    axis.text.x = element_text(size = 9, angle = 90, vjust = 0.5, hjust = 1),
-    axis.title.y = element_text(size = 11, margin = margin(r = 10)),
-    axis.title.y.right = element_text(size = 11, margin = margin(l = 10)),
+    plot.title = element_text(size = 22, face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 12)),
+    axis.text.x = element_text(size = 12, angle = 0, vjust = 0.5, hjust = 0.5),
+    axis.text.y = element_text(size = 13),
+    axis.title.y = element_text(size = 14, margin = margin(r = 10)),
+    axis.title.y.right = element_text(size = 14, margin = margin(l = 10)),
     panel.grid.minor = element_blank(),
     panel.grid.major.x = element_blank(),
-    panel.grid.major.y = element_line(color = "grey85", linewidth = 0.4),
+    panel.grid.major.y = element_line(color = "grey88", linewidth = 0.5),
+    plot.margin = margin(t = 14, r = 18, b = 18, l = 14),
     legend.position = "none"
   )
 
 print(p)
 
 ggsave(
-  "nhs_sickness_vs_positivity.png",
+  "nhs_sickness_vs_positivity_substack.png",
   plot = p,
-  width = 16,
-  height = 9,
-  dpi = 300,
+  width = 18,
+  height = 10,
+  dpi = 320,
   bg = "white"
 )
 
-cat("\nPlot saved as 'nhs_sickness_vs_positivity.png'\n")
+cat("\nPlot saved as 'nhs_sickness_vs_positivity_substack.png'\n")

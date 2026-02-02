@@ -191,12 +191,48 @@ color_sick   <- "grey40"
 color_dose_bar <- "#56B4E9"  # single dose bar color
 
 # =============================================================================
-# Plot (aligned style with the monthly chart)
+# PLOT — Substack/print friendly (larger fonts, cleaner x-axis, less clutter)
 # =============================================================================
 
+# ---- Colors (self-contained) ----
+color_deaths   <- "grey25"
+color_pos      <- "#D55E00"   # positivity (scaled)
+color_sick     <- "grey45"    # sickness (scaled, dashed)
+color_dose_bar <- "#56B4E9"   # quarterly dose bars
+color_trend    <- "#D55E00"   # trend line (keep same family as positivity)
+
+# ---- Excess labels: reduce clutter by labeling Q4 only (edit if you prefer) ----
+excess_labels <- dat2 %>%
+  filter(year_end >= 2021, year_end <= 2025, q_num == 4L) %>%
+  mutate(label = sprintf("%+.1f%%", excess_pct))
+
+# ---- Background shading (same periods) ----
+PLOT_START <- as.Date(min(dat2$q_start, na.rm = TRUE))
+PLOT_END   <- as.Date(max(dat2$q_start, na.rm = TRUE))
+
+periods_bg <- tibble(
+  period = c("no_tests", "corr_high", "corr_none"),
+  xmin   = ymd(c(format(PLOT_START, "%Y-%m-%d"), "2020-05-01", "2022-05-01")),
+  xmax   = ymd(c("2020-05-01", "2022-05-01", format(PLOT_END %m+% months(4), "%Y-%m-%d"))),
+  fill   = c("#EEEEEE", "#DFF2E1", "#F6DADA")
+)
+stopifnot(all(!is.na(periods_bg$xmin)), all(!is.na(periods_bg$xmax)))
+stopifnot(all(periods_bg$xmax > periods_bg$xmin))
+
+# ---- X-axis: keep only FY start separators (April); label every 6 months ----
+x_min <- floor_date(PLOT_START, unit = "month")
+x_max <- ceiling_date(PLOT_END %m+% months(3), unit = "month")
+
+x_breaks_apr <- seq(
+  ymd(sprintf("%d-04-01", year(x_min) - 1L)),
+  ymd(sprintf("%d-04-01", year(x_max) + 1L)),
+  by = "1 year"
+)
+grid_apr <- tibble(x = x_breaks_apr)
+
 p <- ggplot(dat2, aes(x = q_start)) +
-  
-  # Background shading
+
+  # --- Background shading ---
   geom_rect(
     data = periods_bg,
     aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill),
@@ -204,81 +240,83 @@ p <- ggplot(dat2, aes(x = q_start)) +
     alpha = 0.70
   ) +
   scale_fill_identity() +
-  
-  # Quarter separators + FY (April) separators
-  geom_vline(
-    data = grid_q,
-    aes(xintercept = x),
-    color = "grey92", linetype = "dashed", linewidth = 0.3
-  ) +
+
+  # --- FY (April) separators only ---
   geom_vline(
     data = grid_apr,
     aes(xintercept = x),
-    color = "grey80", linetype = "solid", linewidth = 0.8
+    color = "grey85",
+    linewidth = 0.7
   ) +
-  
-  # Doses bars (scaled onto left axis)
+
+  # --- Doses bars (scaled onto left axis) ---
   geom_rect(
     aes(
-      xmin = q_start - days(35), xmax = q_start + days(35),
+      xmin = q_start - days(38), xmax = q_start + days(38),
       ymin = left_min, ymax = doses_scaled
     ),
     fill = color_dose_bar, alpha = 0.55, na.rm = TRUE
   ) +
-  
-  # Positivity scaled (red)
+
+  # --- Positivity scaled (red) ---
   geom_line(
     aes(y = pos_scaled),
-    color = color_pos, linewidth = 1.1, na.rm = TRUE
+    color = color_pos, linewidth = 1.6, na.rm = TRUE
   ) +
-  
-  # Optional sickness scaled (grey, dashed) — remove if you don’t want it
+
+  # --- Optional sickness scaled (grey dashed) ---
   geom_line(
     aes(y = sick_scaled),
-    color = color_sick, linewidth = 1.0, linetype = "dashed", na.rm = TRUE
+    color = color_sick, linewidth = 1.2, linetype = "dashed", na.rm = TRUE
   ) +
-  
-  # Deaths line (actual)
+
+  # --- Deaths line + points ---
   geom_line(
     aes(y = rate_per_100k),
-    color = color_deaths, linewidth = 1.4, na.rm = TRUE
+    color = color_deaths, linewidth = 2.0, na.rm = TRUE
   ) +
-  geom_point(aes(y = rate_per_100k), size = 2.2, color = color_deaths, na.rm = TRUE) +
-  
-  # Trend (solid 2011–2019)
+  geom_point(
+    aes(y = rate_per_100k),
+    size = 2.6, color = color_deaths, na.rm = TRUE
+  ) +
+
+  # --- Trend: solid 2011–2019, dashed 2020+ (same color family) ---
   geom_line(
     data = pred_solid,
     aes(x = q_start, y = pred_rate, group = 1),
-    color = "red",
-    linewidth = 1.2
+    color = color_trend,
+    linewidth = 1.5
   ) +
-  # Trend (dashed 2020+)
   geom_line(
     data = pred_dashed,
     aes(x = q_start, y = pred_rate, group = 1),
-    color = "red",
+    color = color_trend,
     linetype = "dashed",
-    linewidth = 1.2
+    linewidth = 1.5
   ) +
-  
-  # Excess labels
-  geom_text(
+
+  # --- Excess labels (Q4 only) ---
+  geom_label(
     data = excess_labels,
     aes(x = q_start, y = rate_per_100k, label = label),
-    vjust = -0.8,
-    size = 3.2
+    fill = alpha("white", 0.90),
+    color = "grey20",
+    label.size = 0.25,
+    size = 3.2,
+    fontface = "bold",
+    nudge_y = 0.15
   ) +
-  
+
   scale_x_date(
-    breaks = x_breaks_q,
-    labels = label_q,
-    expand = expansion(mult = c(0.02, 0.05))
+    date_breaks = "6 months",
+    date_labels = "%b\n%Y",
+    expand = expansion(mult = c(0.01, 0.03))
   ) +
-  
+
   scale_y_continuous(
     limits = c(left_min, left_max),
     labels = label_comma(),
-    name = "Deaths per 100,000 (quarterly, normalized by April denominator)",
+    name = "Deaths per 100,000 (quarterly; normalised by April denominator)",
     sec.axis = sec_axis(
       ~ if (!is.na(k_dose)) pmax(0, (. - left_min) / k_dose) else .,
       name = "Vaccine doses administered (quarterly sum)",
@@ -286,24 +324,37 @@ p <- ggplot(dat2, aes(x = q_start)) +
       labels = label_number(scale_cut = cut_short_scale())
     )
   ) +
-  
+
   labs(
-    title = "NHS Staff: Quarterly Deaths vs Vaccine doses, Positivity & Sickness",
-    subtitle = "Grey: deaths | Blue bars: doses (quarterly sum) | Red: positivity (scaled) | Grey dashed: sickness (scaled) | Trend: 2011–2019 then dashed from 2020",
+    title = "NHS staff: quarterly deaths vs doses, positivity, and sickness",
+    subtitle = "Grey: deaths | Blue bars: doses (quarterly sum) | Orange: positivity (scaled) | Grey dashed: sickness (scaled) | Trend: 2011–2019 (solid), 2020+ (dashed)",
     x = NULL
   ) +
-  
-  theme_minimal(base_size = 14) +
+
+  theme_minimal(base_size = 18) +
   theme(
-    plot.title = element_text(size = 16, face = "bold", margin = margin(b = 5)),
-    plot.subtitle = element_text(size = 9, color = "grey40", margin = margin(b = 10)),
-    axis.text.x = element_text(size = 9, angle = 90, vjust = 0.5, hjust = 1),
-    axis.title.y = element_text(size = 11, margin = margin(r = 10)),
-    axis.title.y.right = element_text(size = 11, margin = margin(l = 10)),
+    plot.title = element_text(size = 22, face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(size = 13, color = "grey35", margin = margin(b = 12)),
+    axis.text.x = element_text(size = 12, angle = 0, vjust = 0.5, hjust = 0.5),
+    axis.text.y = element_text(size = 13),
+    axis.title.y = element_text(size = 14, margin = margin(r = 10)),
+    axis.title.y.right = element_text(size = 14, margin = margin(l = 10)),
     panel.grid.minor = element_blank(),
     panel.grid.major.x = element_blank(),
-    panel.grid.major.y = element_line(color = "grey85", linewidth = 0.4),
+    panel.grid.major.y = element_line(color = "grey88", linewidth = 0.5),
+    plot.margin = margin(t = 14, r = 18, b = 18, l = 14),
     legend.position = "none"
   )
 
 print(p)
+
+ggsave(
+  "nhs_staff_quarterly_deaths_substack.png",
+  plot = p,
+  width = 18,
+  height = 10,
+  dpi = 320,
+  bg = "white"
+)
+
+cat("\nPlot saved as 'nhs_staff_quarterly_deaths_substack.png'\n")
