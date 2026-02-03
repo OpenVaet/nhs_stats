@@ -3,12 +3,14 @@
 # Uses ACTUAL NHS observed data
 # =============================================================================
 #
-# Tests three COVID hypotheses:
-#   1. "static"      - COVID adds a constant risk factor
-#   2. "exponential" - COVID risk grows (Long COVID / cumulative damage)
-#   3. "attenuating" - Normal viral evolution (severe first, then milder)
+# Tests four COVID hypotheses:
+#   1. "static"                  - COVID adds a constant risk factor
+#   2. "exponential"             - COVID risk grows (Long COVID / cumulative damage)
+#   3. "attenuating"             - Normal viral evolution (severe first, then milder)
 #
 # Combined with four vaccine efficacy scenarios: 0%, 30%, 60%, 95%
+#
+#   4. "increased sickness risk" - COVID Vaccines adds a decaying risk factor.
 #
 # =============================================================================
 
@@ -46,6 +48,31 @@ merged <- data.frame(
   positivity = as.numeric(merged_raw$pos_monthly)
 )
 merged$doses[is.na(merged$doses)] <- 0
+
+# Load actual vaccine doses administered (monthly)
+vax_doses_raw <- read.csv("data/nhs_staff_vax_model_monthly.csv", stringsAsFactors = FALSE)
+vax_doses <- data.frame(
+  month = as.Date(paste0(vax_doses_raw$month, "-01")),
+  first_dose = as.numeric(vax_doses_raw$first_dose),
+  second_dose = as.numeric(vax_doses_raw$second_dose),
+  third_dose = as.numeric(vax_doses_raw$third_dose)
+)
+vax_doses[is.na(vax_doses)] <- 0
+vax_doses$total_doses <- vax_doses$first_dose + vax_doses$second_dose + vax_doses$third_dose
+
+# Compute cumulative first doses (proxy for "ever vaccinated")
+vax_doses$cumulative_first <- cumsum(vax_doses$first_dose)
+
+# NHS staff population ~1.48 million
+NHS_STAFF_POP <- 1480000
+vax_doses$coverage_pct <- vax_doses$cumulative_first / NHS_STAFF_POP
+
+cat("Vaccination data loaded:\n")
+cat("  Months with data:", nrow(vax_doses), "\n")
+cat("  Total first doses:", sum(vax_doses$first_dose), "\n")
+cat("  Peak monthly first doses:", max(vax_doses$first_dose), "in", 
+    format(vax_doses$month[which.max(vax_doses$first_dose)], "%b %Y"), "\n")
+cat("  Final coverage:", round(max(vax_doses$coverage_pct) * 100, 1), "%\n\n")
 
 # =============================================================================
 # SECTION 2: Calibration from observed baseline
@@ -96,12 +123,14 @@ run_sirs <- function(
     growth_rate = 0.4,   # exponential: annual growth
     decay_rate = 0.6,    # attenuating: annual decay
     # Scenario 4 parameters (vaccine-induced sickness)
-    vax_harm_peak = 800,      # peak additional sickness per 100k from vaccine
+    vax_harm_peak = 800,      # peak additional sickness per 100k per dose-cohort
     vax_harm_decay = 0.5,     # annual decay rate of vaccine-induced harm
     # Sickness scaling
     severity_acute = 35000,     # acute sickness per I
     severity_persistent = 800,  # persistent elevation per cumulative exposure
-    seasonal_beta = 0.25        # seasonal variation in transmission
+    seasonal_beta = 0.25,       # seasonal variation in transmission
+    # Use actual vax data
+    use_actual_vax = TRUE
 ) {
   
   gamma <- 1 / infectious_period
@@ -189,10 +218,28 @@ run_sirs <- function(
   out$month_num <- as.integer(format(out$date, "%m"))
   out$baseline <- BASELINE_MEAN + MONTH_EFFECTS[out$month_num]
   
-  # Vaccination coverage
-  out$days_vax <- as.numeric(out$date - VAX_START)
-  out$vax_cov <- ifelse(out$date < VAX_START, 0, 
-                        vax_final * plogis((out$days_vax - 90) / 30))
+  # Vaccination coverage - use actual data if available and scenario 4
+  if (use_actual_vax && covid_scenario == "vax_harm") {
+    # Merge actual vax coverage by month
+    out <- merge(out, vax_doses[, c("month", "coverage_pct", "first_dose")], 
+                 by = "month", all.x = TRUE)
+    out <- out[order(out$date), ]
+    out$coverage_pct[is.na(out$coverage_pct)] <- 0
+    out$first_dose[is.na(out$first_dose)] <- 0
+    
+    # Forward-fill coverage for days within months
+    out$vax_cov <- out$coverage_pct
+    # After last vax data, assume coverage stays at max
+    max_cov <- max(out$coverage_pct, na.rm = TRUE)
+    out$vax_cov[out$date > max(vax_doses$month)] <- max_cov
+    
+  } else {
+    # Use sigmoid approximation
+    out$days_vax <- as.numeric(out$date - VAX_START)
+    out$vax_cov <- ifelse(out$date < VAX_START, 0, 
+                          vax_final * plogis((out$days_vax - 90) / 30))
+    out$first_dose <- 0
+  }
   
   # Severity multiplier by scenario
   out$days_covid <- as.numeric(out$date - COVID_INTRO)
@@ -229,14 +276,36 @@ run_sirs <- function(
   }
   
   # 3. Vaccine-induced sickness (Scenario 4 only)
-  if (covid_scenario == "vax_harm") {
-    # Vaccination causes increased sickness risk that decays over time
-    # The harm is proportional to coverage and decays from peak
+  if (covid_scenario == "vax_harm" && use_actual_vax) {
+    # Compute harm as sum of contributions from each monthly dose cohort
+    # Each cohort's harm decays from their vaccination date
+    out$vax_induced_sickness <- 0
+    
+    for (i in 1:nrow(vax_doses)) {
+      vax_month <- vax_doses$month[i]
+      doses_this_month <- vax_doses$first_dose[i]
+      
+      if (doses_this_month > 0) {
+        # Fraction of population vaccinated this month
+        frac_vaxxed <- doses_this_month / NHS_STAFF_POP
+        
+        # Days since this cohort was vaccinated
+        days_since_vax <- as.numeric(out$date - vax_month)
+        
+        # Harm from this cohort: peaks at vaccination, decays over time
+        # Only contributes after vaccination date
+        cohort_harm <- ifelse(days_since_vax >= 0,
+                              vax_harm_peak * frac_vaxxed * exp(-vax_harm_decay * days_since_vax / 365),
+                              0)
+        
+        out$vax_induced_sickness <- out$vax_induced_sickness + cohort_harm
+      }
+    }
+  } else if (covid_scenario == "vax_harm") {
+    # Fallback to sigmoid-based harm
     out$vax_induced_sickness <- ifelse(out$date < VAX_START, 0, {
       days_since_vax_start <- as.numeric(out$date - VAX_START)
-      # Harm ramps up with coverage, then decays
       coverage_factor <- out$vax_cov
-      # Decay from time since individual vaccination (approximated by time since rollout midpoint)
       time_decay <- exp(-vax_harm_decay * pmax(0, days_since_vax_start - 180) / 365)
       vax_harm_peak * coverage_factor * time_decay
     })
@@ -257,10 +326,10 @@ run_sirs <- function(
   
   # Aggregate to monthly
   monthly <- aggregate(
-    cbind(sickness, baseline, covid_sickness, I, vax_cov) ~ month,
+    cbind(sickness, baseline, covid_sickness, I, vax_cov, vax_induced_sickness) ~ month,
     data = out, FUN = mean
   )
-  names(monthly) <- c("month", "sickness_rate", "baseline", "covid_contrib", "I_mean", "vax_cov")
+  names(monthly) <- c("month", "sickness_rate", "baseline", "covid_contrib", "I_mean", "vax_cov", "vax_harm")
   monthly$scenario <- covid_scenario
   monthly$vax_eff <- vax_eff_infection
   
@@ -297,7 +366,7 @@ for (scen in scenarios) {
 
 # Scenario 4: Vaccine-induced harm (with different harm levels)
 cat("\n  Running Scenario 4: Vaccine-induced sickness...\n")
-vax_harm_levels <- c(800, 1000, 1200, 1400)  # Different peak harm levels
+vax_harm_levels <- c(600, 800, 1000, 1200, 1400, 1600)  # Different peak harm levels
 
 for (harm in vax_harm_levels) {
   label <- paste0("vax_harm_", harm)
@@ -306,7 +375,8 @@ for (harm in vax_harm_levels) {
   res <- run_sirs(
     covid_scenario = "vax_harm",
     vax_harm_peak = harm,
-    vax_harm_decay = 0.4
+    vax_harm_decay = 0.4,
+    use_actual_vax = TRUE
   )
   res$scenario_label <- label
   all_results[[idx]] <- res
@@ -393,7 +463,7 @@ if (length(ve_match) > 0) {
 }
 
 # Save metrics
-write.csv(metrics, "data/sirs_fit_metrics_v2.csv", row.names = FALSE)
+write.csv(metrics, "data/sirs_fit_metrics.csv", row.names = FALSE)
 
 # =============================================================================
 # SECTION 6: Generate Plots
@@ -403,10 +473,11 @@ cat("\nGenerating plots...\n")
 
 # Color scheme
 ve_colors <- c("0" = "#E41A1C", "30" = "#FF7F00", "60" = "#4DAF4A", "95" = "#377EB8")
-harm_colors <- c("800" = "#984EA3", "1000" = "#FF7F00", "1200" = "#E41A1C", "1400" = "#A65628")
+harm_colors <- c("600" = "#984EA3", "800" = "#FF7F00", "1000" = "#E41A1C", 
+                 "1200" = "#A65628", "1400" = "#377EB8", "1600" = "#4DAF4A")
 
 # Plot 1: All scenarios faceted (scenarios 1-3)
-png("sirs_scenarios_vs_observed_v2.png", width = 1400, height = 1100, res = 100)
+png("sirs_scenarios_vs_observed.png", width = 1400, height = 1100, res = 100)
 par(mfrow = c(3, 1), mar = c(4, 5, 3, 2), oma = c(2, 0, 3, 0))
 
 xlim <- as.Date(c("2019-01-01", "2025-10-01"))
@@ -476,10 +547,10 @@ mtext("Red = COVID intro | Blue = Vax start | Green = 90% vax | Pink = Structura
       outer = TRUE, side = 1, cex = 0.85, line = 0.5)
 
 dev.off()
-cat("  Saved: sirs_scenarios_vs_observed_v2.png\n")
+cat("  Saved: sirs_scenarios_vs_observed.png\n")
 
 # Plot 2: Best fits comparison
-png("sirs_best_fits_v2.png", width = 1400, height = 700, res = 100)
+png("sirs_best_fits.png", width = 1400, height = 700, res = 100)
 par(mar = c(5, 5, 4, 2))
 
 top3 <- metrics$scenario[1:min(3, nrow(metrics))]
@@ -528,7 +599,7 @@ rmse_text <- paste(sapply(seq_along(top3), function(i) {
 mtext(rmse_text, side = 1, line = 3.8, cex = 0.8)
 
 dev.off()
-cat("  Saved: sirs_best_fits_v2.png\n")
+cat("  Saved: sirs_best_fits.png\n")
 
 # Plot 3, 4, 5: Individual full-screen plots for each scenario (1-3)
 for (scen in c("static", "exponential", "attenuating")) {
@@ -676,7 +747,7 @@ text(B3_DATE, 3700, "B3", cex = 0.7, col = "#CC79A7", pos = 4)
 
 # Simulated lines for scenario 4 (different harm levels)
 lwd_sim <- 2.2
-for (harm in c("800", "1000", "1200", "1400")) {
+for (harm in c("600", "800", "1000", "1200", "1400", "1600")) {
   label <- paste0("vax_harm_", harm)
   d <- all_sims[all_sims$scenario_label == label, ]
   if (nrow(d) > 0) {
@@ -689,7 +760,7 @@ lines(observed$month, observed$sickness_obs, col = "black", lwd = 3)
 points(observed$month, observed$sickness_obs, col = "black", pch = 16, cex = 0.6)
 
 # Legend with RMSE values
-legend_labels_harm <- sapply(c("800", "1000", "1200", "1400"), function(h) {
+legend_labels_harm <- sapply(c("600", "800", "1000", "1200", "1400", "1600"), function(h) {
   label <- paste0("vax_harm_", h)
   m <- metrics[metrics$scenario == label, ]
   if (nrow(m) > 0) {
@@ -728,6 +799,6 @@ cat(paste(rep("=", 60), collapse = ""), "\n")
 cat("SIMULATION COMPLETE\n")
 cat(paste(rep("=", 60), collapse = ""), "\n")
 cat("\nOutput files:\n")
-cat("  - sirs_scenarios_vs_observed_v2.png (all scenarios)\n")
-cat("  - sirs_best_fits_v2.png (top 3 best-fitting scenarios)\n")
-cat("  - data/sirs_fit_metrics_v2.csv (fit statistics)\n")
+cat("  - sirs_scenarios_vs_observed.png (all scenarios)\n")
+cat("  - sirs_best_fits.png (top 3 best-fitting scenarios)\n")
+cat("  - data/sirs_fit_metrics.csv (fit statistics)\n")
