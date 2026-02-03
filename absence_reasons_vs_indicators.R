@@ -24,6 +24,7 @@ suppressPackageStartupMessages({
 	library(tidyverse)
 	library(lubridate)
 	library(scales)
+	library(ggrepel)
 })
 
 # ---- Force English month names for axis labels (Windows/French OS safe) ----
@@ -280,19 +281,6 @@ periods_bg <- tibble(
 	fill   = c("#EEEEEE", "#DFF2E1", "#F6DADA")
 )
 
-# -----------------------------------------------------------------------------
-# (3) % labels inside columns when there is enough space
-# For stacked bars: label segments only if they are "tall" enough (in % points)
-# -----------------------------------------------------------------------------
-label_threshold <- 6  # <-- tune (e.g. 4, 5, 6) depending on how crowded it is
-
-reason_stack <- reason_stack %>%
-	mutate(
-		seg_label = if_else(!is.na(sa_pct_norm) & sa_pct_norm >= label_threshold,
-												sprintf("%.0f%%", sa_pct_norm),
-												NA_character_)
-	)
-
 # =============================================================================
 # PLOT — Substack/print friendly (larger fonts, cleaner x-axis, readable labels)
 # =============================================================================
@@ -310,11 +298,11 @@ markers <- tibble(
 )
 
 # Put marker labels in the top band: ALWAYS > 100 and < left_max
-markers <- markers %>%
-	mutate(
-		y_label = if_else(row_number() %% 2 == 1, left_max - 1.6, left_max - 3.4),
-		y_label = pmin(left_max - 0.8, pmax(101, y_label))
-	)
+markers <- tibble(
+  date = as.Date(c("2020-01-31", "2020-12-08", "2021-11-01", "2022-04-15")),
+  short_label = c("COVID", "Vax start", "90% vax & mandates", "Mandates dropped")
+) %>%
+  mutate(y = left_max - 1.0)   # all start near the top; ggrepel spreads them
 
 # ---- X-axis: keep only January separators; label every 6 months ----
 x_min <- floor_date(min(df_line$month, na.rm = TRUE), unit = "month")
@@ -331,21 +319,20 @@ periods_bg <- tibble(
 	fill   = c("#EEEEEE", "#DFF2E1", "#F6DADA")
 )
 
-# ---- Segment labels: show only if segment is tall enough ----
-# For a percent-share chart, smaller labels quickly become noise.
-label_threshold <- 7
-reason_stack <- reason_stack %>%
-	mutate(
-		seg_label = if_else(!is.na(sa_pct_norm) & sa_pct_norm >= label_threshold,
-												sprintf("%.0f%%", sa_pct_norm),
-												NA_character_)
-	)
-
 # ---- Softer line colors (stand out but don’t fight the stack) ----
 color_pos     <- "#C77C2E"   # softened orange for positivity
 color_doses   <- "#4E79A7"   # muted blue for doses
 color_breaks  <- "#B07AA1"   # muted purple for breakpoints
 color_markers <- "#C77C2E"
+
+# --- Fill palette that scales to any number of categories ---
+n_fill <- nlevels(reason_stack$reason_grp)
+
+fill_vals <- scales::hue_pal(l = 70, c = 90)(n_fill)  # pastel-ish, but unlimited
+names(fill_vals) <- levels(reason_stack$reason_grp)
+
+# Optional: force "Others" to grey so it reads as "residual"
+if ("Others" %in% names(fill_vals)) fill_vals["Others"] <- "grey75"
 
 p <- ggplot() +
 
@@ -376,16 +363,6 @@ p <- ggplot() +
 		linewidth = 0.18
 	) +
 
-	# Segment labels (only big segments)
-	geom_text(
-		data = reason_stack,
-		aes(x = month, y = sa_pct_norm, label = seg_label),
-		position = position_stack(vjust = 0.5),
-		size = 3.2,
-		colour = "grey15",
-		na.rm = TRUE
-	) +
-
 	# Positivity scaled
 	geom_line(
 		data = df_line,
@@ -407,16 +384,6 @@ p <- ggplot() +
 		linetype = "dashed", linewidth = 1.0,
 		color = color_markers, alpha = 0.70
 	) +
-	geom_label(
-		data = markers,
-		aes(x = date, y = y_label, label = short_label),
-		color = "grey15",
-		fill = alpha("white", 0.92),
-		size = 3.6,
-		fontface = "bold",
-		label.padding = unit(0.18, "lines"),
-		label.size = 0.25
-	) +
 
 	# Structural breaks
 	geom_vline(
@@ -425,20 +392,25 @@ p <- ggplot() +
 		linetype = "longdash", linewidth = 1.2,
 		color = color_breaks, alpha = 0.85
 	) +
-	geom_label(
-		data = all_breaks %>%
-			mutate(
-				y_pos = if_else(row_number() %% 2 == 1,
-												left_max * 0.38,
-												left_max * 0.28)
-			),
-		aes(x = month, y = y_pos, label = label_text),
-		color = color_breaks,
-		fill = alpha("white", 0.93),
-		size = 3.0,
-		fontface = "bold",
-		label.padding = unit(0.18, "lines"),
-		lineheight = 0.95
+	ggrepel::geom_label_repel(
+	  data = markers,
+	  aes(x = date, y = y, label = short_label),
+	  direction = "y",
+	  ylim = c(101, left_max - 0.6),     # keep labels in the top band
+	  box.padding = 0.35,
+	  point.padding = 0.15,
+	  min.segment.length = 0,
+	  max.overlaps = Inf,
+	  seed = 1,
+
+	  color = "grey15",
+	  fill = alpha("white", 0.92),
+	  size = 3.6,
+	  fontface = "bold",
+	  label.padding = unit(0.18, "lines"),
+	  label.size = 0.25,
+	  segment.color = color_markers,
+	  segment.alpha = 0.6
 	) +
 
 	scale_x_date(
@@ -460,7 +432,7 @@ p <- ggplot() +
 	) +
 
 	# Pastel fill for the stacked columns (Top 9 + Others)
-	scale_fill_brewer(palette = "Pastel2") +
+	scale_fill_manual(values = fill_vals) +
 
 	labs(
 		title = "NHS sickness reasons (%) vs vaccine doses and test positivity",

@@ -1,31 +1,6 @@
 # ============================================================================
-# NHS Sickness Rate Analysis — FIXED & FUNCTIONAL (v2)
+# NHS Sickness Rate Analysis
 # Breakpoints vs “observable norm” (2010–2018), seasonality-adjusted
-# ============================================================================
-# The script implements a retrospective time-series analysis of monthly NHS sickness absence rates in England,
-# designed to identify departures from an “observable norm” defined by the pre-event period 2010–2018.
-# Monthly percentages are converted to a rate per 100,000 staff and a 6-month rolling mean is computed using a symmetric window
-# (3 months prior through 2 months after the index month) to provide a smoothed descriptive series.
-
-# To operationalize the “norm,” the script fits an ordinary least squares baseline model on 2010–2018 raw monthly rates
-# with a deterministic linear time component and explicit seasonality via month-of-year fixed effects.
-# This model is then projected over the full series, producing fitted baseline expectations and both confidence and prediction intervals;
-# the baseline expectation is additionally “rolled” to align directly with the 6-month rolling observed series for visual and interpretive comparability.
-# Deviations from the norm are computed as both absolute differences (per-100k) and percentage differences (rolling series relative to the rolled baseline expectation),
-# which are later used for annotation of salient local highs/lows.
-
-# Structural change is assessed using the Bai–Perron multiple breakpoint framework applied not to the raw sickness rates,
-# but to the baseline-adjusted deviation series (raw deviation-from-norm).
-# This explicitly targets breakpoints in abnormality relative to the 2010–2018 regime rather than breaks driven by long-run
-# secular trend or seasonal structure.
-
-# The script supports two breakpoint specifications: an intercept-only model to detect step changes in deviation (“level”)
-# and a time-augmented model to detect changes in deviation slope (“trend”), with the number of breaks selected by BIC under minimum segment-size constraints.
-
-# For each detected breakpoint, approximate 95% confidence intervals for breakpoint timing are computed, and break direction is summarized via local mean deviations
-# in windows around the break. Finally, the script estimates simple within-segment linear trends on the smoothed (rolling) series between
-# break-defined boundaries for descriptive comparison and produces a publication-style plot combining raw data,
-# rolling series, baseline expectation, prediction band, break markers, and deviation labels at local extrema.
 # ============================================================================
 
 # ---- Packages ----
