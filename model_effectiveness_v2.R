@@ -52,8 +52,9 @@ merged$doses[is.na(merged$doses)] <- 0
 # =============================================================================
 
 # Key dates
-COVID_INTRO <- as.Date("2020-01-15")
+COVID_INTRO <- as.Date("2019-09-01")  # B1 breakpoint - when sickness first departs from norm
 VAX_START <- as.Date("2020-12-08")
+VAX_90_DATE <- as.Date("2021-09-01")  # ~92% coverage reached
 B1_DATE <- as.Date("2019-09-01")
 B2_DATE <- as.Date("2021-05-01")
 B3_DATE <- as.Date("2022-12-01")
@@ -94,6 +95,9 @@ run_sirs <- function(
     # Scenario parameters
     growth_rate = 0.4,   # exponential: annual growth
     decay_rate = 0.6,    # attenuating: annual decay
+    # Scenario 4 parameters (vaccine-induced sickness)
+    vax_harm_peak = 800,      # peak additional sickness per 100k from vaccine
+    vax_harm_decay = 0.5,     # annual decay rate of vaccine-induced harm
     # Sickness scaling
     severity_acute = 35000,     # acute sickness per I
     severity_persistent = 800,  # persistent elevation per cumulative exposure
@@ -126,22 +130,27 @@ run_sirs <- function(
     # Seasonal forcing
     seasonal <- 1 + seasonal_beta * cos(2 * pi * (doy - 15) / 365)
     
-    # Beta based on scenario
+    # Beta based on scenario (for scenarios 1-3)
     if (day < t_covid) {
       beta <- 0
     } else {
       days_since <- day - t_covid
       
-      beta <- switch(covid_scenario,
-        "static" = beta_base * seasonal,
-        "exponential" = beta_base * seasonal * (1 + growth_rate * days_since / 365),
-        "attenuating" = beta_base * seasonal * exp(-decay_rate * days_since / 365),
-        beta_base * seasonal
-      )
+      if (covid_scenario == "vax_harm") {
+        # Scenario 4: use attenuating COVID dynamics as base
+        beta <- beta_base * seasonal * exp(-decay_rate * days_since / 365)
+      } else {
+        beta <- switch(covid_scenario,
+          "static" = beta_base * seasonal,
+          "exponential" = beta_base * seasonal * (1 + growth_rate * days_since / 365),
+          "attenuating" = beta_base * seasonal * exp(-decay_rate * days_since / 365),
+          beta_base * seasonal
+        )
+      }
     }
     
-    # Vaccination effect on transmission
-    if (day >= t_vax) {
+    # Vaccination effect on transmission (for scenarios 1-3)
+    if (day >= t_vax && covid_scenario != "vax_harm") {
       days_vax <- day - t_vax
       vax_cov <- vax_final * plogis((days_vax - 90) / 30)
       # Vaccine reduces susceptibility
@@ -187,29 +196,61 @@ run_sirs <- function(
   
   # Severity multiplier by scenario
   out$days_covid <- as.numeric(out$date - COVID_INTRO)
-  out$severity_mult <- ifelse(out$date < COVID_INTRO, 0,
-    switch(covid_scenario,
-      "static" = 1,
-      "exponential" = 1 + growth_rate * pmax(0, out$days_covid) / 365,
-      "attenuating" = exp(-decay_rate * pmax(0, out$days_covid) / 365),
-      1
+  
+  if (covid_scenario == "vax_harm") {
+    # Scenario 4: attenuating COVID + vaccine-induced harm
+    out$severity_mult <- ifelse(out$date < COVID_INTRO, 0,
+                                exp(-decay_rate * pmax(0, out$days_covid) / 365))
+  } else {
+    out$severity_mult <- ifelse(out$date < COVID_INTRO, 0,
+      switch(covid_scenario,
+        "static" = 1,
+        "exponential" = 1 + growth_rate * pmax(0, out$days_covid) / 365,
+        "attenuating" = exp(-decay_rate * pmax(0, out$days_covid) / 365),
+        1
+      )
     )
-  )
+  }
   
   # COVID sickness components
   # 1. Acute: from current infections
   out$acute_covid <- out$I * severity_acute * out$severity_mult
   
   # 2. Persistent: from cumulative exposure (Long COVID / damage accumulation)
-  out$persistent_covid <- switch(covid_scenario,
-    "static" = pmin(out$cumulative_I / 365, 3) * severity_persistent,
-    "exponential" = pmin(out$cumulative_I / 365, 5) * severity_persistent * 1.5,
-    "attenuating" = pmin(out$cumulative_I / 365, 2) * severity_persistent * 0.5,
-    0
-  )
+  if (covid_scenario == "vax_harm") {
+    out$persistent_covid <- pmin(out$cumulative_I / 365, 2) * severity_persistent * 0.5
+  } else {
+    out$persistent_covid <- switch(covid_scenario,
+      "static" = pmin(out$cumulative_I / 365, 3) * severity_persistent,
+      "exponential" = pmin(out$cumulative_I / 365, 5) * severity_persistent * 1.5,
+      "attenuating" = pmin(out$cumulative_I / 365, 2) * severity_persistent * 0.5,
+      0
+    )
+  }
   
-  # Vaccine reduces symptomatic illness
-  out$covid_sickness <- (out$acute_covid + out$persistent_covid) * (1 - out$vax_cov * vax_eff_sickness)
+  # 3. Vaccine-induced sickness (Scenario 4 only)
+  if (covid_scenario == "vax_harm") {
+    # Vaccination causes increased sickness risk that decays over time
+    # The harm is proportional to coverage and decays from peak
+    out$vax_induced_sickness <- ifelse(out$date < VAX_START, 0, {
+      days_since_vax_start <- as.numeric(out$date - VAX_START)
+      # Harm ramps up with coverage, then decays
+      coverage_factor <- out$vax_cov
+      # Decay from time since individual vaccination (approximated by time since rollout midpoint)
+      time_decay <- exp(-vax_harm_decay * pmax(0, days_since_vax_start - 180) / 365)
+      vax_harm_peak * coverage_factor * time_decay
+    })
+  } else {
+    out$vax_induced_sickness <- 0
+  }
+  
+  # For scenarios 1-3: vaccine reduces symptomatic illness
+  if (covid_scenario != "vax_harm") {
+    out$covid_sickness <- (out$acute_covid + out$persistent_covid) * (1 - out$vax_cov * vax_eff_sickness)
+  } else {
+    # Scenario 4: no vaccine benefit, but add vaccine harm
+    out$covid_sickness <- out$acute_covid + out$persistent_covid + out$vax_induced_sickness
+  }
   
   # Total sickness
   out$sickness <- out$baseline + out$covid_sickness
@@ -254,8 +295,26 @@ for (scen in scenarios) {
   }
 }
 
+# Scenario 4: Vaccine-induced harm (with different harm levels)
+cat("\n  Running Scenario 4: Vaccine-induced sickness...\n")
+vax_harm_levels <- c(800, 1000, 1200, 1400)  # Different peak harm levels
+
+for (harm in vax_harm_levels) {
+  label <- paste0("vax_harm_", harm)
+  cat("    ", label, "\n")
+  
+  res <- run_sirs(
+    covid_scenario = "vax_harm",
+    vax_harm_peak = harm,
+    vax_harm_decay = 0.4
+  )
+  res$scenario_label <- label
+  all_results[[idx]] <- res
+  idx <- idx + 1
+}
+
 all_sims <- do.call(rbind, all_results)
-cat("  Total scenarios:", length(unique(all_sims$scenario_label)), "\n\n")
+cat("\n  Total scenarios:", length(unique(all_sims$scenario_label)), "\n\n")
 
 # =============================================================================
 # SECTION 5: Compute Fit Metrics
@@ -334,7 +393,7 @@ if (length(ve_match) > 0) {
 }
 
 # Save metrics
-write.csv(metrics, "data/sirs_fit_metrics.csv", row.names = FALSE)
+write.csv(metrics, "data/sirs_fit_metrics_v2.csv", row.names = FALSE)
 
 # =============================================================================
 # SECTION 6: Generate Plots
@@ -344,9 +403,10 @@ cat("\nGenerating plots...\n")
 
 # Color scheme
 ve_colors <- c("0" = "#E41A1C", "30" = "#FF7F00", "60" = "#4DAF4A", "95" = "#377EB8")
+harm_colors <- c("800" = "#984EA3", "1000" = "#FF7F00", "1200" = "#E41A1C", "1400" = "#A65628")
 
-# Plot 1: All scenarios faceted
-png("sirs_scenarios_vs_observed.png", width = 1400, height = 1100, res = 100)
+# Plot 1: All scenarios faceted (scenarios 1-3)
+png("sirs_scenarios_vs_observed_v2.png", width = 1400, height = 1100, res = 100)
 par(mfrow = c(3, 1), mar = c(4, 5, 3, 2), oma = c(2, 0, 3, 0))
 
 xlim <- as.Date(c("2019-01-01", "2025-10-01"))
@@ -374,6 +434,7 @@ for (scen in c("static", "exponential", "attenuating")) {
   # Events
   abline(v = COVID_INTRO, col = "red", lty = 2, lwd = 1.2)
   abline(v = VAX_START, col = "blue", lty = 2, lwd = 1.2)
+  abline(v = VAX_90_DATE, col = "darkgreen", lty = 2, lwd = 1.2)
   abline(v = B1_DATE, col = "#CC79A7", lty = 3)
   abline(v = B2_DATE, col = "#CC79A7", lty = 3)
   abline(v = B3_DATE, col = "#CC79A7", lty = 3)
@@ -411,14 +472,14 @@ for (scen in c("static", "exponential", "attenuating")) {
 
 mtext("SIRS Model Scenarios vs Observed NHS Sickness Absence", 
       outer = TRUE, cex = 1.4, font = 2, line = 1)
-mtext("Red dashed = COVID intro | Blue dashed = Vax start | Pink dotted = Structural breaks (B1/B2/B3) | Blue band = baseline prediction interval", 
+mtext("Red = COVID intro | Blue = Vax start | Green = 90% vax | Pink = Structural breaks (B1/B2/B3)", 
       outer = TRUE, side = 1, cex = 0.85, line = 0.5)
 
 dev.off()
-cat("  Saved: sirs_scenarios_vs_observed.png\n")
+cat("  Saved: sirs_scenarios_vs_observed_v2.png\n")
 
 # Plot 2: Best fits comparison
-png("sirs_best_fits.png", width = 1400, height = 700, res = 100)
+png("sirs_best_fits_v2.png", width = 1400, height = 700, res = 100)
 par(mar = c(5, 5, 4, 2))
 
 top3 <- metrics$scenario[1:min(3, nrow(metrics))]
@@ -467,17 +528,17 @@ rmse_text <- paste(sapply(seq_along(top3), function(i) {
 mtext(rmse_text, side = 1, line = 3.8, cex = 0.8)
 
 dev.off()
-cat("  Saved: sirs_best_fits.png\n")
+cat("  Saved: sirs_best_fits_v2.png\n")
 
-# Plot 3, 4, 5: Individual full-screen plots for each scenario
+# Plot 3, 4, 5: Individual full-screen plots for each scenario (1-3)
 for (scen in c("static", "exponential", "attenuating")) {
   
   filename <- paste0("sirs_scenario_", scen, ".png")
   
   title_main <- switch(scen,
-    "static" = "Static COVID Risk Scenario",
-    "exponential" = "Exponential COVID Risk Scenario", 
-    "attenuating" = "Attenuating COVID Risk Scenario"
+    "static" = "Scenario 1: Static COVID Risk",
+    "exponential" = "Scenario 2: Exponential COVID Risk", 
+    "attenuating" = "Scenario 3: Attenuating COVID Risk"
   )
   
   subtitle <- switch(scen,
@@ -512,6 +573,7 @@ for (scen in c("static", "exponential", "attenuating")) {
   # Event lines with labels
   abline(v = COVID_INTRO, col = "red", lty = 2, lwd = 1.5)
   abline(v = VAX_START, col = "blue", lty = 2, lwd = 1.5)
+  abline(v = VAX_90_DATE, col = "darkgreen", lty = 2, lwd = 1.5)
   abline(v = B1_DATE, col = "#CC79A7", lty = 3, lwd = 1.2)
   abline(v = B2_DATE, col = "#CC79A7", lty = 3, lwd = 1.2)
   abline(v = B3_DATE, col = "#CC79A7", lty = 3, lwd = 1.2)
@@ -519,9 +581,10 @@ for (scen in c("static", "exponential", "attenuating")) {
   # Event labels at top
   text(COVID_INTRO, 6900, "COVID\narrives", cex = 0.75, col = "red", pos = 4, font = 2)
   text(VAX_START, 6700, "Vax\nstarts", cex = 0.75, col = "blue", pos = 4, font = 2)
-  text(B1_DATE, 6500, "B1", cex = 0.7, col = "#CC79A7", pos = 4)
-  text(B2_DATE, 6500, "B2", cex = 0.7, col = "#CC79A7", pos = 4)
-  text(B3_DATE, 6500, "B3", cex = 0.7, col = "#CC79A7", pos = 4)
+  text(VAX_90_DATE, 6500, "90%\nvax", cex = 0.75, col = "darkgreen", pos = 4, font = 2)
+  text(B1_DATE - 30, 3700, "B1", cex = 0.7, col = "#CC79A7", pos = 4)
+  text(B2_DATE, 3700, "B2", cex = 0.7, col = "#CC79A7", pos = 4)
+  text(B3_DATE, 3700, "B3", cex = 0.7, col = "#CC79A7", pos = 4)
   
   # Simulated lines for this scenario (thicker, more visible)
   lwd_sim <- 2.2
@@ -570,6 +633,92 @@ for (scen in c("static", "exponential", "attenuating")) {
   cat("  Saved:", filename, "\n")
 }
 
+# Plot 6: Scenario 4 - Vaccine-induced harm
+png("sirs_scenario_vax_harm.png", width = 1600, height = 900, res = 120)
+par(mar = c(5, 5, 5, 2))
+
+plot(NA, xlim = xlim, ylim = ylim, 
+     xlab = "Year", ylab = "Sickness rate (per 100,000 staff)",
+     main = "", xaxt = "n", las = 1)
+
+# Title and subtitle
+mtext("Scenario 4: Vaccine-Induced Sickness Risk", side = 3, line = 2.5, cex = 1.5, font = 2)
+mtext("Attenuating COVID + vaccination causes temporary increased all-cause sickness risk (decaying over time)", 
+      side = 3, line = 1, cex = 0.95, col = "grey30")
+
+# X axis
+axis(1, at = as.Date(paste0(years, "-01-01")), labels = years)
+
+# Grid
+abline(h = seq(3500, 7000, 500), col = "grey90")
+abline(v = as.Date(paste0(years, "-01-01")), col = "grey90")
+
+# Prediction band
+polygon(c(pred_data$month, rev(pred_data$month)),
+        c(pred_data$pred_low, rev(pred_data$pred_high)),
+        col = rgb(0.6, 0.6, 0.9, 0.25), border = NA)
+
+# Event lines
+abline(v = COVID_INTRO, col = "red", lty = 2, lwd = 1.5)
+abline(v = VAX_START, col = "blue", lty = 2, lwd = 1.5)
+abline(v = VAX_90_DATE, col = "darkgreen", lty = 2, lwd = 1.5)
+abline(v = B1_DATE, col = "#CC79A7", lty = 3, lwd = 1.2)
+abline(v = B2_DATE, col = "#CC79A7", lty = 3, lwd = 1.2)
+abline(v = B3_DATE, col = "#CC79A7", lty = 3, lwd = 1.2)
+
+# Event labels
+text(COVID_INTRO, 6900, "COVID\narrives", cex = 0.75, col = "red", pos = 4, font = 2)
+text(VAX_START, 6700, "Vax\nstarts", cex = 0.75, col = "blue", pos = 4, font = 2)
+text(VAX_90_DATE, 6500, "90%\nvax", cex = 0.75, col = "darkgreen", pos = 4, font = 2)
+text(B1_DATE - 30, 3700, "B1", cex = 0.7, col = "#CC79A7", pos = 4)
+text(B2_DATE, 3700, "B2", cex = 0.7, col = "#CC79A7", pos = 4)
+text(B3_DATE, 3700, "B3", cex = 0.7, col = "#CC79A7", pos = 4)
+
+# Simulated lines for scenario 4 (different harm levels)
+lwd_sim <- 2.2
+for (harm in c("800", "1000", "1200", "1400")) {
+  label <- paste0("vax_harm_", harm)
+  d <- all_sims[all_sims$scenario_label == label, ]
+  if (nrow(d) > 0) {
+    lines(d$month, d$sickness_rate, col = harm_colors[harm], lwd = lwd_sim)
+  }
+}
+
+# Observed data
+lines(observed$month, observed$sickness_obs, col = "black", lwd = 3)
+points(observed$month, observed$sickness_obs, col = "black", pch = 16, cex = 0.6)
+
+# Legend with RMSE values
+legend_labels_harm <- sapply(c("800", "1000", "1200", "1400"), function(h) {
+  label <- paste0("vax_harm_", h)
+  m <- metrics[metrics$scenario == label, ]
+  if (nrow(m) > 0) {
+    paste0("Peak harm = ", h, " (RMSE: ", m$rmse, ")")
+  } else {
+    paste0("Peak harm = ", h)
+  }
+})
+
+legend("topleft",
+       legend = c("Observed NHS data", legend_labels_harm),
+       col = c("black", harm_colors),
+       lwd = c(3, rep(lwd_sim, 4)),
+       pch = c(16, NA, NA, NA, NA),
+       pt.cex = 0.8,
+       cex = 0.9, bg = "white", box.lty = 1, box.col = "grey70")
+
+# Best fit annotation
+best_harm <- metrics[grepl("vax_harm", metrics$scenario), ][1, ]
+if (nrow(best_harm) > 0 && !is.na(best_harm$scenario)) {
+  interp_text <- paste0("Best fit for Scenario 4: ", best_harm$scenario,
+                        " | RMSE=", best_harm$rmse,
+                        " | r=", best_harm$corr)
+  mtext(interp_text, side = 1, line = 3.5, cex = 0.85, font = 3)
+}
+
+dev.off()
+cat("  Saved: sirs_scenario_vax_harm.png\n")
+
 # =============================================================================
 # SECTION 7: Summary
 # =============================================================================
@@ -579,6 +728,6 @@ cat(paste(rep("=", 60), collapse = ""), "\n")
 cat("SIMULATION COMPLETE\n")
 cat(paste(rep("=", 60), collapse = ""), "\n")
 cat("\nOutput files:\n")
-cat("  - sirs_scenarios_vs_observed.png (all scenarios)\n")
-cat("  - sirs_best_fits.png (top 3 best-fitting scenarios)\n")
-cat("  - data/sirs_fit_metrics.csv (fit statistics)\n")
+cat("  - sirs_scenarios_vs_observed_v2.png (all scenarios)\n")
+cat("  - sirs_best_fits_v2.png (top 3 best-fitting scenarios)\n")
+cat("  - data/sirs_fit_metrics_v2.csv (fit statistics)\n")
