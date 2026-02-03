@@ -1,0 +1,4 @@
+"tag","mean2","sd2","median_extra2","median_total2","mean3","sd3","median_extra3","median_total3","peak2_month","peak2_doses","peak3_month","peak3_doses","peak2_shift_mo","peak3_shift_mo"
+"baseline_m60",60,20,60,81,60,20,60,150,"2021-04",513845,"2021-10",398248,0,0
+"m45",45,20,45,66,45,20,45,135,"2021-03",499875,"2021-09",423792,-1,-1
+"m75",75,20,75,96,75,20,75,165,"2021-04",487698,"2021-10",417001,0,0
